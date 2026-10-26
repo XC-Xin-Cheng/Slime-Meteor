@@ -1,0 +1,247 @@
+package me.matl114.utils.config.kv;
+
+import com.google.common.base.Preconditions;
+import com.google.common.base.Suppliers;
+import com.google.common.util.concurrent.Runnables;
+import com.mojang.datafixers.util.Pair;
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import lombok.experimental.Accessors;
+import me.matl114.gui.Constants;
+import me.matl114.gui.basic.*;
+import me.matl114.gui.elements.IconElement;
+import me.matl114.gui.interfaces.DefaultElementFactory;
+import me.matl114.gui.interfaces.ElementFactory;
+import me.matl114.managers.api.Displayable;
+import me.matl114.managers.config.ConfigEnum;
+import me.matl114.utils.ReflectUtils;
+import me.matl114.utils.config.AttrKeyValue;
+import me.matl114.utils.config.BaseAttrKeyValue;
+import me.matl114.utils.config.WrapperFactory;
+import net.minecraft.text.Text;
+import org.apache.commons.lang3.function.Consumers;
+import org.apache.commons.lang3.mutable.MutableBoolean;
+
+@Accessors(chain = true)
+public class EnumAttrKeyValue<T> extends BaseAttrKeyValue<T> {
+    public static <T> WrapperFactory<String, T> createFiniteMapLookup(Map<String, T> map) {
+        Map<T, String> inverseMap = new HashMap<>();
+        for (var re : map.entrySet()) {
+            inverseMap.put(re.getValue(), re.getKey());
+        }
+        return WrapperFactory.of(
+                s -> {
+                    var re = map.get(s);
+                    if (re != null) {
+                        return re;
+                    } else throw WrapperFactory.PARSE_FAILURE;
+                },
+                inverseMap::get);
+    }
+
+    protected final Map<String, T> finiteValueMap;
+
+    public Map<String, T> getValueMap() {
+        return finiteValueMap;
+    }
+
+    Class<T> identifier;
+
+    public EnumAttrKeyValue(String key, T value, Class<T> clazz, Map<String, T> finiteValueMap) {
+        super(key, value, (CustomWidgetGenerator<T>) ENUM_WIDGET_FACTORY, createFiniteMapLookup(finiteValueMap));
+        this.finiteValueMap = finiteValueMap;
+        this.identifier = clazz;
+    }
+
+    public static final CustomWidgetGenerator<?> ENUM_WIDGET_FACTORY = (factory, s, x, y, dx, dy) -> {
+        if (s instanceof EnumAttrKeyValue attrKeyValue) {
+            return attrKeyValue.generateSwitchingButton(factory, x, y, dx, dy, Consumers.nop());
+        } else {
+            return BaseAttrKeyValue.generateTextInputValueWidget(factory, s, x, y, dx, dy);
+        }
+    };
+
+    public static <T extends Enum<T>> CustomWidgetGenerator<T> createEnumWidgetFactory(Class<T> enumClass) {
+
+        Map<String, T> map;
+        if (ConfigEnum.class.isAssignableFrom(enumClass)) {
+            map = ConfigEnum.getMap(enumClass);
+        } else {
+            map = ReflectUtils.getEnumMap(enumClass);
+        }
+
+        return createFiniteLookupWidgetFactory(map);
+    }
+
+    public static <T> CustomWidgetGenerator<T> createFiniteLookupWidgetFactory(Map<String, T> map) {
+        Preconditions.checkArgument(!map.isEmpty());
+        Class<?> enumClass = map.values().iterator().next().getClass();
+        List<Pair<String, Supplier<Text>>> flattenMap;
+        if (Displayable.class.isAssignableFrom(enumClass)) {
+            Map<String, Displayable> valueMap = (Map) map;
+            flattenMap = valueMap.entrySet().stream()
+                    .map((entry) -> new Pair<>(entry.getKey(), (Supplier<Text>) entry.getValue()::getDisplay))
+                    .toList();
+        } else {
+            flattenMap = map.keySet().stream()
+                    .map(v -> new Pair<>(v, (Supplier<Text>) () -> Text.translatableWithFallback(v, v)))
+                    .toList();
+        }
+        return (factory, s, x, y, dx, dy) -> {
+            return generateSwitchingButton(factory, flattenMap, s, x, y, dx, dy, Runnables.doNothing());
+        };
+    }
+
+    public DrawableWidget generateSwitchingButton(
+            int x, int y, int dx, int dy, Consumer<EnumAttrKeyValue<T>> callback) {
+        return generateSwitchingButton(DefaultElementFactory.INSTANCE, x, y, dx, dy, callback);
+    }
+
+    public DrawableWidget generateSwitchingButton(
+            ElementFactory factory, int x, int y, int dx, int dy, Consumer<EnumAttrKeyValue<T>> callback) {
+        List<Pair<String, Supplier<Text>>> flattenMap;
+        if (Displayable.class.isAssignableFrom(identifier)) {
+            Map<String, Displayable> valueMap = (Map<String, Displayable>) (this).getValueMap();
+            flattenMap = valueMap.entrySet().stream()
+                    .map((entry) -> new Pair<>(entry.getKey(), (Supplier<Text>) entry.getValue()::getDisplay))
+                    .toList();
+        } else {
+            flattenMap = ((EnumAttrKeyValue<T>) this)
+                    .getValueMap().keySet().stream()
+                            .map(v -> new Pair<>(v, (Supplier<Text>) () -> Text.translatableWithFallback(v, v)))
+                            .toList();
+        }
+        return generateSwitchingButton(factory, flattenMap, this, x, y, dx, dy, () -> {
+            callback.accept(this);
+        });
+    }
+
+    public static DrawableWidget generateSwitchingButton(
+            List<Pair<String, Supplier<Text>>> flattenMap,
+            AttrKeyValue<?> ex,
+            int x,
+            int y,
+            int dx,
+            int dy,
+            Runnable runnable) {
+        return generateSwitchingButton(DefaultElementFactory.INSTANCE, flattenMap, ex, x, y, dx, dy, runnable);
+    }
+
+    public static DrawableWidget generateSwitchingButton(
+            ElementFactory factory,
+            List<Pair<String, Supplier<Text>>> flattenMap,
+            AttrKeyValue<?> ex,
+            int x,
+            int y,
+            int dx,
+            int dy,
+            Runnable runnable) {
+
+        int choices = flattenMap.size();
+        if (choices > 0) {
+            AtomicInteger integer = new AtomicInteger();
+            Runnable kvUpdater = () -> {
+                String val = ex.getInput();
+                int index = -1;
+                for (int i = 0; i < choices; ++i) {
+                    if (Objects.equals(val, flattenMap.get(i).getFirst())) {
+                        index = i;
+                        break;
+                    }
+                }
+                if (index == -1) {
+                    ex.setInput(flattenMap.get(0).getFirst());
+                    index = 0;
+                } else {
+                    ex.setInput(flattenMap.get(index).getFirst());
+                }
+                integer.set(index);
+            };
+            kvUpdater.run();
+            SubScreenWidget subScreen = new SubScreenWidget(x, y, dx, dy);
+            Runnable indexUpdater = () -> {
+                ex.setInput(flattenMap.get(integer.get()).getFirst());
+                runnable.run();
+            };
+            boolean needSwitch = dx > 2 * dy;
+            int mainDx = needSwitch ? dx - dy : dx;
+            subScreen.addDrawableChild(factory.createExecuteButton(
+                    () -> {
+                        kvUpdater.run();
+                        return flattenMap.get(integer.get()).getSecond().get();
+                    },
+                    () -> List.of(Text.translatable(ex.getKeyName())),
+                    ButtonAction.run(() -> {
+                        kvUpdater.run();
+                        int index0 = integer.get();
+                        index0 = (index0 + 1) % choices;
+                        integer.set(index0);
+                        indexUpdater.run();
+                    }),
+                    0,
+                    0,
+                    mainDx,
+                    dy));
+            if (needSwitch) {
+                MutableBoolean show = new MutableBoolean(false);
+                subScreen.addDrawableChild(factory.createElement(
+                        IconElement.statedGuiPredicate(
+                                Constants.EXPAND_GUI_ON_SPRITE,
+                                Constants.EXPAND_GUI_OFF_SPRITE,
+                                ButtonAction.run(() -> show.setValue(!show.booleanValue())),
+                                (eee) -> show.booleanValue()),
+                        null,
+                        null,
+                        dx - dy,
+                        0,
+                        dy,
+                        dy));
+                Supplier<SubScreenWidget> subScreenSupplier = Suppliers.memoize(() -> {
+                    SubScreenWidget selectors = new SubScreenWidget(0, 0, 0, 0).setPriority(1);
+                    int height = 0;
+                    for (int i = 0; i < choices; ++i) {
+                        var section = flattenMap.get(i);
+                        var supplier = section.getSecond();
+                        final int finalI = i;
+                        selectors.addDrawableChild(factory.createExecuteButton(
+                                supplier,
+                                () -> List.of(Text.translatable(ex.getKeyName())),
+                                ButtonAction.run(() -> {
+                                    integer.set(finalI);
+                                    indexUpdater.run();
+                                    show.setValue(false);
+                                }),
+                                () -> {
+                                    kvUpdater.run();
+                                    return integer.get() == finalI;
+                                },
+                                0,
+                                height,
+                                dx - dy,
+                                dy));
+                        height += dy;
+                    }
+                    return selectors;
+                });
+                ContentDelegateWidget<SubScreenWidget> dynamicDelegate =
+                        new DynamicContentWidget<>(() -> show.booleanValue() ? subScreenSupplier.get() : null, 2, dy);
+                subScreen.addDrawableChild(dynamicDelegate);
+            }
+            return subScreen;
+        } else {
+            // no choice
+            return factory.createExecuteButton(
+                    () -> Text.empty(),
+                    () -> List.of(Text.translatable(ex.getKeyName())),
+                    ButtonAction.empty(),
+                    x,
+                    y,
+                    dx,
+                    dy);
+        }
+    }
+}

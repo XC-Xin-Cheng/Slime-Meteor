@@ -1,0 +1,72 @@
+package me.matl114.managers.config;
+
+import com.google.common.base.Charsets;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import me.matl114.managers.FileManager;
+import me.matl114.plugins.MainPlugin;
+import me.matl114.utils.Debug;
+import org.yaml.snakeyaml.Yaml;
+
+public class ConfigLoader {
+
+    public static Config SERVER_CONFIG;
+
+    public static void copyFile(File file, String internalFileName) {
+        if (!file.exists()) {
+            try {
+                if (!file.getParentFile().exists()) {
+                    Files.createDirectories(file.toPath().getParent());
+                }
+                Files.copy(MainPlugin.class.getResourceAsStream("/" + internalFileName), file.toPath());
+            } catch (Throwable e) {
+                Debug.info("创建配置文件时找不到相关默认配置文件,即将生成空文件");
+                try {
+                    Files.createDirectories(file.toPath().getParent());
+                    Files.createFile(file.toPath());
+                } catch (IOException e1) {
+                    Debug.info("创建空配置文件失败!");
+                }
+            }
+        }
+    }
+
+    public static Config loadInternalConfig(String internalFileName, String customName) {
+        try {
+            return new ConfigImpl(customName, null, loadYamlConfig((Reader) (new InputStreamReader(
+                    MainPlugin.class.getResourceAsStream("/" + internalFileName), Charsets.UTF_8))));
+        } catch (Throwable e) {
+            Debug.info("failed to load internal config " + internalFileName + ".yml, Error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    public static Config loadExternalConfig(File cfgFile, String customName) {
+        String fileName = cfgFile.getName();
+        copyFile(cfgFile, fileName);
+        return new ConfigImpl(customName, cfgFile);
+    }
+
+    public static Config loadRuntimeConfig(String name, String customName) {
+        return loadExternalConfig(FileManager.getInstance().getRuntimeFile(name), customName)
+                .registerAutoSave();
+    }
+
+    public static HashMap<String, Object> loadYamlConfig(File file) {
+        try (var fileInput = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
+            return loadYamlConfig(fileInput);
+        } catch (Throwable e) {
+            Debug.info("failed to load yaml config " + file.getName() + ".yml, Error: " + e.getMessage());
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static HashMap<String, Object> loadYamlConfig(Reader reader) {
+        Yaml yaml = new Yaml();
+        HashMap obj = yaml.load(reader);
+        return obj == null ? new LinkedHashMap<>() : obj;
+    }
+}

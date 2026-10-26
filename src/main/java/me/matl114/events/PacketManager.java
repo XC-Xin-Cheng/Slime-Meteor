@@ -1,0 +1,407 @@
+package me.matl114.events;
+
+import com.google.common.collect.Queues;
+import com.google.common.util.concurrent.Runnables;
+import it.unimi.dsi.fastutil.objects.ReferenceArraySet;
+import it.unimi.dsi.fastutil.objects.ReferenceSet;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import javax.annotation.Nonnull;
+import lombok.Getter;
+import me.matl114.events.annotations.Broadcast;
+import me.matl114.events.annotations.Cancelable;
+import me.matl114.events.annotations.ExtraArgs;
+import me.matl114.events.channels.EventChannel;
+import me.matl114.events.channels.ListenerPoint;
+import me.matl114.events.packets.PacketStorage;
+import me.matl114.events.packets.PacketStorageRecvImpl;
+import me.matl114.events.packets.PacketStorageSendImpl;
+import me.matl114.managers.ScheduleService;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.network.ClientConnection;
+import net.minecraft.network.listener.ClientPlayPacketListener;
+import net.minecraft.network.packet.CommonPackets;
+import net.minecraft.network.packet.Packet;
+import net.minecraft.network.packet.PacketType;
+import net.minecraft.network.packet.PlayPackets;
+import net.minecraft.network.packet.c2s.common.KeepAliveC2SPacket;
+import net.minecraft.network.packet.c2s.config.ReadyC2SPacket;
+import net.minecraft.network.packet.c2s.play.*;
+import net.minecraft.network.packet.s2c.common.DisconnectS2CPacket;
+import net.minecraft.network.packet.s2c.common.KeepAliveS2CPacket;
+import net.minecraft.network.packet.s2c.play.*;
+import net.minecraft.world.World;
+
+public class PacketManager {
+    // this queue should be accessed only in event loop
+    public static ConcurrentLinkedQueue<PacketStorage.Recv> packetQueueIn = Queues.newConcurrentLinkedQueue();
+    // this queue can be accessed async
+    public static final ConcurrentLinkedQueue<PacketStorage.Send> packetQueueOut = Queues.newConcurrentLinkedQueue();
+
+    public static final WeakHashMap<Packet<?>, List<Consumer<Event<Packet<?>>>>> postScheduleSendQueue =
+            new WeakHashMap<>();
+
+    public static <T extends Packet<?>> void schedulePostScheduleCallback(T post, Runnable packet) {
+        if (packet == null) return;
+        schedulePostScheduleCallback(post, (ev) -> {
+            packet.run();
+        });
+    }
+
+    public static <T extends Packet<?>> void schedulePostScheduleCallback(T post, Consumer<Event<T>> packet) {
+        if (packet == null) return;
+        postScheduleSendQueue.computeIfAbsent(post, (kv) -> new ArrayList<>()).add((Consumer) packet);
+    }
+
+    public static void onPostPacketScheduleSend(Event<Packet<?>> packet) {
+        var lst = postScheduleSendQueue.remove(packet.context);
+        if (lst != null && !lst.isEmpty()) {
+            for (var pkt : lst) {
+                pkt.accept(packet);
+            }
+        }
+    }
+
+    static {
+        Listener.getPacketPostScheduleSendPoint().registerHandler(PacketManager::onPostPacketScheduleSend);
+    }
+    // must visit in eventLoop
+    public static boolean startFlushIn = false;
+    public static boolean startFlushOut = false;
+    private static final MinecraftClient mc = MinecraftClient.getInstance();
+
+    public static boolean handleQueueInPacket(Packet<?> packet, ClientConnection connection) {
+        // do not handle flushing packets
+        if (startFlushIn) {
+            return false;
+        }
+        checkImmediatelyFlush();
+        // todo: what about BundlePacket
+        if (connection.getPacketListener() instanceof ClientPlayPacketListener play) {
+            if (packet instanceof DisconnectS2CPacket
+                    || (packet instanceof HealthUpdateS2CPacket hl && hl.getHealth() <= 0.0)
+                    || packet instanceof PlayerRespawnS2CPacket
+                    || packet instanceof EnterReconfigurationS2CPacket) {
+                // clear all
+                clearAndShutdown();
+            } else {
+                Event<PacketStorage.Recv> queueEvent = new Event<>(
+                        new PacketStorageRecvImpl(packet, System.currentTimeMillis(), connection),
+                        true,
+                        false,
+                        connection,
+                        true);
+                packetQueueInEvent.handleValue(queueEvent);
+                if (queueEvent.isCancelled()) {
+                    handleQueueIn(queueEvent.context());
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public static void clearAndShutdown() {
+        schedule(() -> {
+            queueShutdownEvent.broadcast(null);
+            flushOutBound(Runnables.doNothing());
+        });
+    }
+
+    static boolean immediatelyFlush;
+
+    public static void scheduleImmediateFlush() {
+        immediatelyFlush = true;
+    }
+
+    public static void schedule(Runnable runnable) {
+        if (mc.getNetworkHandler() == null) {
+            runnable.run();
+            return;
+        }
+        scheduleInEventLoop(mc.getNetworkHandler().getConnection(), runnable);
+    }
+
+    public static void scheduleInEventLoop(@Nonnull ClientConnection connection, Runnable runnable) {
+        if (connection.isOpen()) {
+            if (connection.channel.eventLoop().inEventLoop(Thread.currentThread())) {
+                runnable.run();
+            } else {
+                connection.channel.eventLoop().execute(runnable);
+            }
+        } else {
+            runnable.run();
+        }
+    }
+
+    private static void checkImmediatelyFlush() {
+        if (immediatelyFlush) {
+            immediatelyFlush = false;
+            flushInBoundInternal(false);
+        }
+    }
+
+    public static boolean handleQueueOutPacket(
+            Packet<?> packet, BiConsumer<Packet<?>, Boolean> callback, ClientConnection connection) {
+        if (startFlushOut) {
+            return false;
+        }
+        // just come to PLAY stage, do not queue
+        if (packet instanceof ReadyC2SPacket) {
+            //
+            return false;
+        }
+        if (connection.getPacketListener() instanceof ClientPlayPacketListener play) {
+            if (packet instanceof AcknowledgeReconfigurationC2SPacket) {
+                clearAndShutdown();
+            } else {
+                Event<PacketStorage.Send> queueEvent = new Event<>(
+                        new PacketStorageSendImpl(packet, System.currentTimeMillis(), callback),
+                        true,
+                        false,
+                        connection);
+                packetQueueOutEvent.handleValue(queueEvent);
+                if (queueEvent.isCancelled()) {
+                    handleQueueOut(queueEvent.context());
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void flushInBoundInternal(boolean escapePipeline) {
+        if (mc.getNetworkHandler() != null) {
+            Runnable task = () -> {
+                try {
+                    if (startFlushIn) {
+                        return;
+                    }
+                    if (mc.getNetworkHandler() != null
+                            && mc.getNetworkHandler().getConnection().isOpen()) {
+                        // flush
+                        // do not trigger recursive call
+                        startFlushIn = true;
+                        immediatelyFlush = false;
+                        try {
+                            var oldQueue = packetQueueIn;
+                            packetQueueIn = new ConcurrentLinkedQueue<>();
+                            for (var packet : oldQueue) {
+                                // abort if need a immediate flush
+                                if (immediatelyFlush) {
+                                    packetQueueIn.add(packet);
+                                    continue;
+                                }
+                                if (!escapePipeline) {
+                                    Event<PacketStorage.Recv> queueEvent = new Event<>(
+                                            packet,
+                                            true,
+                                            false,
+                                            mc.getNetworkHandler().getConnection(),
+                                            false);
+                                    packetQueueInEvent.handleValue(queueEvent);
+                                    if (queueEvent.isCancelled()) {
+                                        packetQueueIn.add(packet);
+                                        continue;
+                                    }
+                                }
+                                packet.handle();
+                            }
+                        } finally {
+                            startFlushIn = false;
+                            // clear async
+                        }
+                    } else {
+                        packetQueueIn.clear();
+                    }
+                } catch (Throwable e) {
+                    packetQueueIn.clear();
+                }
+            };
+            if (mc.getNetworkHandler().getConnection().channel.eventLoop().inEventLoop(Thread.currentThread())) {
+                task.run();
+            } else {
+                mc.getNetworkHandler().getConnection().channel.eventLoop().execute(task);
+            }
+        } else {
+            packetQueueIn.clear();
+        }
+    }
+
+    public static void flushOutBound(Runnable postFlushTask) {
+
+        if (mc.getNetworkHandler() != null
+                && mc.getNetworkHandler().getConnection().isOpen()) {
+            // flush
+            ClientConnection conn = mc.getNetworkHandler().getConnection();
+            scheduleInEventLoop(conn, () -> {
+                startFlushOut = true;
+                try {
+                    List<PacketStorage.Send> storages = new ArrayList<>(packetQueueOut);
+                    if (!storages.isEmpty()) {
+                        for (var re : storages) {
+                            re.send(false);
+                        }
+                        mc.getNetworkHandler().getConnection().flush();
+                    }
+                } finally {
+                    startFlushOut = false;
+                    packetQueueOut.clear();
+                    postFlushTask.run();
+                }
+            });
+        } else {
+            packetQueueOut.clear();
+            postFlushTask.run();
+        }
+    }
+
+    public static void flushOutBound(Function<PacketStorage, FlushAction> pdd, Runnable postFlushTask) {
+        if (mc.getNetworkHandler() != null
+                && mc.getNetworkHandler().getConnection().isOpen()) {
+            // flush
+            ClientConnection conn = mc.getNetworkHandler().getConnection();
+            scheduleInEventLoop(conn, () -> {
+                startFlushOut = true;
+                var iter = packetQueueOut.iterator();
+                try {
+                    List<PacketStorage.Send> storages = new ArrayList<>();
+                    while (iter.hasNext()) {
+                        var packet = iter.next();
+                        switch (pdd.apply(packet)) {
+                            case FLUSH -> {
+                                storages.add(packet);
+                                iter.remove();
+                            }
+                            case DROP -> {
+                                iter.remove();
+                            }
+                        }
+                    }
+                    if (!storages.isEmpty()) {
+                        for (var re : storages) {
+                            re.send(false);
+                        }
+                        mc.getNetworkHandler().getConnection().flush();
+                    }
+                } finally {
+                    startFlushOut = false;
+                    postFlushTask.run();
+                }
+            });
+        } else {
+            packetQueueOut.removeIf((v) -> pdd.apply(v) != FlushAction.QUEUE);
+            postFlushTask.run();
+        }
+    }
+
+    public static boolean isAsyncOrNotTransactionC2SPacket(Packet<?> pkt) {
+        if (pkt instanceof KeepAliveC2SPacket
+                || pkt instanceof ChatCommandSignedC2SPacket
+                || pkt instanceof ChatMessageC2SPacket
+                || pkt instanceof CommandExecutionC2SPacket
+                || pkt instanceof RequestCommandCompletionsC2SPacket) return true;
+        return false;
+    }
+
+    private static final ReferenceSet<PacketType<?>> packetSet1 = new ReferenceArraySet<>();
+
+    static {
+        packetSet1.add(CommonPackets.KEEP_ALIVE_C2S);
+        packetSet1.add(PlayPackets.CHAT_COMMAND_SIGNED);
+        packetSet1.add(PlayPackets.CHAT_COMMAND);
+        packetSet1.add(PlayPackets.CHAT);
+        packetSet1.add(PlayPackets.COMMAND_SUGGESTION);
+    }
+
+    public static boolean isAsyncOrNotTransactionC2SPacket(PacketType<?> pkt) {
+        return pkt != null && packetSet1.contains(pkt);
+    }
+
+    private static final ReferenceSet<PacketType<?>> packetSet2 = new ReferenceArraySet<>();
+
+    static {
+        packetSet2.add(CommonPackets.KEEP_ALIVE_S2C);
+        packetSet2.add(PlayPackets.PLAYER_CHAT);
+        packetSet2.add(PlayPackets.SYSTEM_CHAT);
+        packetSet2.add(PlayPackets.CONTAINER_CLOSE_S2C);
+    }
+
+    public static boolean isInventoryPacket(Packet<?> pkt) {
+        return pkt instanceof ClickSlotC2SPacket || pkt instanceof CloseHandledScreenC2SPacket;
+    }
+
+    public static boolean isInventoryPacket(PacketType<?> pkt) {
+        return pkt == PlayPackets.CONTAINER_CLICK || pkt == PlayPackets.CONTAINER_CLOSE_C2S;
+    }
+
+    public static boolean isAsyncOrNotTransactionS2CPacket(Packet<?> pkt) {
+        if (pkt instanceof KeepAliveS2CPacket
+                || pkt instanceof ChatMessageS2CPacket
+                || pkt instanceof GameMessageS2CPacket
+                || pkt instanceof CloseScreenS2CPacket
+                || pkt instanceof ChunkDataS2CPacket) return true;
+        return false;
+    }
+
+    public static boolean isAsyncOrNotTransactionS2CPacket(PacketType<?> pkt) {
+        return pkt != null && packetSet2.contains(pkt);
+    }
+
+    public static void handleQueueIn(PacketStorage.Recv packet) {
+        packetQueueIn.add(packet);
+    }
+
+    public static void handleQueueOut(PacketStorage.Send packet) {
+        packetQueueOut.add(packet);
+    }
+
+    @Getter
+    @Cancelable
+    @ExtraArgs({ClientConnection.class, boolean.class})
+    public static EventChannel<PacketStorage.Recv> packetQueueInEvent = new EventChannel<>();
+
+    @Getter
+    @Cancelable
+    @ExtraArgs({ClientConnection.class})
+    public static EventChannel<PacketStorage.Send> packetQueueOutEvent = new EventChannel<>();
+
+    @Getter
+    @Broadcast
+    public static EventChannel<Void> queueShutdownEvent = new EventChannel<>();
+
+    public static void onDisconnect(Event<Void> disconnect) {
+        clearAndShutdown();
+    }
+
+    public static void onWorldSwitch(Event<World> event) {
+        clearAndShutdown();
+    }
+
+    protected static <W> void registerListener(ListenerPoint<W> listener, Consumer<W> handler) {
+        listener.registerHandler(handler);
+    }
+
+    private static void flushInEveryMs() {
+        if (mc.player == null || mc.world == null) return;
+        if (packetQueueIn.isEmpty()) return;
+        flushInBoundInternal(false);
+    }
+
+    static {
+        registerListener(Listener.getServerLeavePoint(), PacketManager::onDisconnect);
+        registerListener(Listener.getWorldSwitchPoint(), PacketManager::onWorldSwitch);
+        ScheduleService.launchAsyncRepeatTask(PacketManager::flushInEveryMs, 1, 1);
+    }
+
+    public static enum FlushAction {
+        DROP,
+        FLUSH,
+        QUEUE;
+    }
+}

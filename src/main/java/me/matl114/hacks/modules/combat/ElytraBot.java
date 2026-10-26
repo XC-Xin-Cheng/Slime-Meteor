@@ -1,0 +1,2566 @@
+package me.matl114.hacks.modules.combat;
+
+import com.mojang.datafixers.util.Pair;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import javax.annotation.Nullable;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import me.matl114.SlimefunHelper;
+import me.matl114.accessors.access.PlayerInteractEntityC2SPacketAccess;
+import me.matl114.accessors.hacks.EntityInternalAccess;
+import me.matl114.events.Event;
+import me.matl114.events.Listener;
+import me.matl114.events.RenderListener;
+import me.matl114.events.impl.EventContainer;
+import me.matl114.events.impl.Render2D;
+import me.matl114.events.impl.Render3D;
+import me.matl114.gui.basic.DrawableWidget;
+import me.matl114.gui.basic.DynamicContentWidget;
+import me.matl114.hacks.CombatTasks;
+import me.matl114.hacks.MovTasks;
+import me.matl114.hacks.RenderTasks;
+import me.matl114.hacks.api.BaseModule;
+import me.matl114.hacks.api.ModulePath;
+import me.matl114.hacks.modules.move.ElytraExtra;
+import me.matl114.hacks.modules.move.PlayerStateManager;
+import me.matl114.hacks.utils.EntityUtils;
+import me.matl114.hacks.utils.HotKeyUtils;
+import me.matl114.hacks.utils.config.*;
+import me.matl114.hacks.utils.entity.PredictorImpl;
+import me.matl114.hacks.utils.enums.BypassMode;
+import me.matl114.hacks.utils.enums.PredictionMode;
+import me.matl114.hacks.utils.move.ElytraMotion;
+import me.matl114.hacks.utils.move.ElytraOptimizeUtils;
+import me.matl114.managers.Configs;
+import me.matl114.managers.Tasks;
+import me.matl114.managers.config.*;
+import me.matl114.managers.input.MultiKeyBind;
+import me.matl114.utils.*;
+import me.matl114.utils.algorithms.StateMachine;
+import me.matl114.utils.entity.PlayerInputUtils;
+import me.matl114.versioned.api.VDataFlag;
+import me.matl114.versioned.api.VItem;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityPose;
+import net.minecraft.entity.EntityType;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.network.packet.c2s.play.PlayerInteractEntityC2SPacket;
+import net.minecraft.network.packet.s2c.play.EntityDamageS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec2f;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+
+public class ElytraBot extends BaseModule {
+    public final ModulePath combatBot = makePath(Configs.COMBAT_CONFIG, "combat-bot");
+    public final ModulePath elytraBot = combatBot.add("elytra-bot");
+
+    public static ElytraBot INSTANCE;
+
+    public ElytraBot() {
+        super("ElytraBot");
+        bindFlag(enable);
+        INSTANCE = this;
+    }
+
+    public final FlagRef enable = flagBuilder(elytraBot.add("enable")).build();
+
+    public final KeyBindRef keyBind = moduleEntry(
+                    elytraBot.add("hotkey"), new MultiKeyBind(), elytraBot.add("enable"), moduleMeta(() -> this.mode))
+            .build();
+
+    public final IntRef targetRange = intBuilder(elytraBot.add("range"))
+            .defaultValue(80)
+            .validator(Configs.INT_POSITIVE)
+            .build();
+
+    public final EnumRef<Mode> mode =
+            builder(elytraBot.add("mode"), Mode.class).defaultValue(Mode.FOLLOW).build();
+
+    public final FlagRef playerOnly = builder(elytraBot.add("player-only"), FlagRef.TYPE)
+            .defaultValue(true)
+            .build();
+
+    public final FlagRef autoControl =
+            flagBuilder(elytraBot.add("auto-control-elytra")).build();
+
+    public final FlagRef dynamicTarget =
+            flagBuilder(elytraBot.add("dynamic-target")).build();
+
+    public final FlagRef onlyWhenNoWASD =
+            flagBuilder(elytraBot.add("only-when-no-wasd")).build();
+
+    public final DoubleRef combatMaceRange = builder(elytraBot.add("combat-range"), DoubleRef.TYPE)
+            .defaultValue(10.0D)
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final DoubleRef combatSpearRange = builder(elytraBot.add("combat-spear-range"), DoubleRef.TYPE)
+            .defaultValue(11.0D)
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final FlagRef followFriend = flagBuilder(elytraBot.add("follower-follow-friend"))
+            .show(() -> mode.get().isIn(Mode.FOLLOW))
+            .build();
+
+    public final FlagRef maceUsePredictor = flagBuilder(elytraBot.add("mace-pull-up-use-predictor"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef logSpearHit = flagBuilder(elytraBot.add("log-spear-hit"))
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final FlagRef spearUsePredictor = flagBuilder(elytraBot.add("spear-use-predictor"))
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final FlagRef render = flagBuilder(elytraBot.add("render")).build();
+
+    public final KeyBindRef switchMode = hotkey(elytraBot.add("switch-hotkey"))
+            .defaultValue(new MultiKeyBind())
+            .registerHotkey(HotKeyUtils.wrapAsHandler(this::onSwitch))
+            .build();
+
+    private final ModulePath attackMace = elytraBot.add("mace-attack-settings");
+
+    {
+        portConfigs(elytraBot, attackMace, "mace-combat-use-extra-attack");
+        portConfigs(elytraBot, attackMace, "mace-post-attack");
+        portConfigs(elytraBot, attackMace, "mace-combat-consider-use");
+    }
+
+    public final DoubleRef maceMinFallDistance = builder(attackMace.add("mace-min-fall-distance"), DoubleRef.TYPE)
+            .defaultValue(1.5D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef maceAttackUseSimple = builder(attackMace.add("mace-combat-use-extra-attack"), Boolean.class)
+            .defaultValue(true)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef appendPostAttack = builder(attackMace.add("mace-post-attack"), Boolean.class)
+            .defaultValue(false)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef maceAttackConsiderUse = flagBuilder(attackMace.add("mace-combat-consider-use"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef maceFix = flagBuilder(attackMace.add("mace-fix"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceSwapTargetPredictTicks = doubleBuilder(attackMace.add("mace-pre-swap-prediction"))
+            .defaultValue(0.5D)
+            .validator(Configs.doubleRange(-10.0D, 10.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceEstimatedDelay = doubleBuilder(attackMace.add("mace-pre-swap-delay"))
+            .defaultValue(3.0D)
+            .validator(Configs.doubleRange(0, 10))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final NBTRef<LabelVec2> macePreSwapSpeed = builder(
+                    attackMace.add("mace-pre-swap-self-speed-prediction"), LabelVec2.class)
+            .defaultValue(new LabelVec2(
+                    "widget.elytra-bot.mace-fix.extra-bonus",
+                    "widget.elytra-bot.mace-fix.predict-multiply",
+                    new Vec2(0.0D, 1.0D)))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final IntRef maceSwapMinDelay = intBuilder(attackMace.add("mace-swap-min-delay"))
+            .defaultValue(6)
+            .validator(Configs.INT_NONNEGATIVE)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    private final ModulePath maceHeightAndChase = elytraBot.add("mace-height-and-pull-up");
+
+    {
+        portConfigs(elytraBot, maceHeightAndChase, "mace-height");
+        portConfigs(elytraBot, maceHeightAndChase, "mace-height-ground");
+        portConfigs(elytraBot, maceHeightAndChase, "mace-max-extra-pull-up-tick");
+        portConfigs(elytraBot.add("combat-smooth-flight"), maceHeightAndChase.add("combat-smooth-flight-pullup"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-1"),
+                maceHeightAndChase.add("combat-smooth-flight-circle-extra-range"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-1-1"),
+                maceHeightAndChase.add("combat-smooth-flight-out-pull-ratio"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-1-6"),
+                maceHeightAndChase.add("combat-smooth-flight-out-pull-ratio-enable-distance"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-1-5"),
+                maceHeightAndChase.add("combat-smooth-flight-out-pull-ratio-use-horizontal-distance"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-1-4"),
+                maceHeightAndChase.add("combat-smooth-flight-dynamic-circle-extra-range"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-2"), maceHeightAndChase.add("combat-smooth-flight-pullup-attack"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-2-1"),
+                maceHeightAndChase.add("combat-smooth-flight-pull-attack-max-horizontal"));
+        portConfigs(
+                elytraBot.add("combat-smooth-flight-argument-2-2"),
+                maceHeightAndChase.add("combat-smooth-flight-pull-attack-max-relative-y"));
+    }
+
+    public final DoubleRef maceHeight = builder(maceHeightAndChase.add("mace-height"), DoubleRef.TYPE)
+            .defaultValue(10.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceHeightGround = builder(maceHeightAndChase.add("mace-height-ground"), DoubleRef.TYPE)
+            .defaultValue(10.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final IntRef maceRemainPullUpTick = builder(
+                    maceHeightAndChase.add("mace-max-extra-pull-up-tick"), IntRef.TYPE)
+            .defaultValue(20)
+            .validator(Configs.INT_NONNEGATIVE)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef maceTryFollowUsePredictor = flagBuilder(
+                    maceHeightAndChase.add("mace-use-predictor-to-judge-follow"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef maceChaseFollowYBias = flagBuilder(
+                    maceHeightAndChase.add("combat-mace-chase-follow-use-y-bias"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceChaseFollowBiasStartHorizontalRange = doubleBuilder(
+                    maceHeightAndChase.add("combat-mace-chase-follow-use-y-bias-range"))
+            .defaultValue(15.0D)
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceChaseFollowBiasExtraHeightPerBlock = doubleBuilder(
+                    maceHeightAndChase.add("combat-mace-chase-follow-use-y-bias-extra-height-per-block"))
+            .defaultValue(0.6)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef combatSmoothFlightPullup = flagBuilder(maceHeightAndChase.add("combat-smooth-flight-pullup"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef combatSmoothCircleExtraRange = doubleBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-circle-extra-range"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(1.0D)
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final NBTRef<OptionalPrimitive<Vec3>> combatSmoothCircleDynamicRangeByHeight = builder(
+                    maceHeightAndChase.add("combat-smooth-flight-dynamic-circle-extra-range"),
+                    OptionalPrimitive.type(Vec3.class))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(new OptionalPrimitive<>(false, NBTTypes.VEC3_TYPE, new Vec3(10, 0.3, 20)))
+            .build();
+
+    public final DoubleRef combatSmoothOutPullRatio = doubleBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-out-pull-ratio"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(1.0D)
+            .build();
+
+    public final DoubleRef combatSmoothOutPullRatioEnableDistance = doubleBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-out-pull-ratio-enable-distance"))
+            .defaultValue(16.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final FlagRef combatSmoothOutPullRatioUseHorizontalDistance = flagBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-out-pull-ratio-use-horizontal-distance"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef combatSmoothFlightPullupAttack = flagBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-pullup-attack"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef combatSmoothFlightPullupAttackMaxHorizontal = doubleBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-pull-attack-max-horizontal"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(10.0D)
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final DoubleRef combatSmoothFlightPullupAttackMinRelativeY = doubleBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-pull-attack-min-relative-y"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(0.0D)
+            .build();
+
+    public final DoubleRef combatSmoothFlightPullupAttackMaxRelativeY = doubleBuilder(
+                    maceHeightAndChase.add("combat-smooth-flight-pull-attack-max-relative-y"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(10.0D)
+            .build();
+
+    public final FlagRef macePullupUseV5 = flagBuilder(maceHeightAndChase.add("mace-pullup-use-v5"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef macePullupUseV5Distance = doubleBuilder(
+                    maceHeightAndChase.add("mace-pullup-use-v5-distance"))
+            .defaultValue(20.0D)
+            .validator(Configs.doubleRange(0.0D, 1000.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final ModulePath maceFollow = elytraBot.add("mace-follow-and-attack");
+
+    {
+        portConfigs(elytraBot, maceFollow, "mace-max-follow-height");
+        portConfigs(elytraBot, maceFollow, "mace-y-level-lerp");
+    }
+
+    public final NBTRef<OptionalPrimitive<Double>> followOnGroundHeight = builder(
+                    maceFollow.add("follow-on-ground-height-extra"), OptionalPrimitive.DOUBLE_TYPE)
+            .defaultValue(new OptionalPrimitive<>(true, NBTTypes.DOUBLE_TYPE, 2.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceFollowMinHeight = doubleBuilder(maceFollow.add("mace-max-follow-height"))
+            .defaultValue(1.5D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final DoubleRef maceYLevelWeight = doubleBuilder(maceFollow.add("mace-y-level-lerp"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .defaultValue(0.0)
+            .validator(Configs.doubleRange(-5.0D, 5.0D))
+            .build();
+
+    public final DoubleRef chooseDownTargetDistance = builder(
+                    maceFollow.add("choose-down-target-distance"), DoubleRef.TYPE)
+            .defaultValue(3.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .validator(Configs.doubleRange(-36.0D, 36.0D))
+            .build();
+
+    public final FlagRef followDownPosWhenLow = builder(maceFollow.add("follow-lerp-pos-when-low"), Boolean.class)
+            .defaultValue(false)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef minPitchDownwards = doubleBuilder(maceFollow.add("follow-min-pitch-deg"))
+            .defaultValue(15.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .validator(Configs.doubleRange(0.0D, 90.0D))
+            .build();
+
+    public final FlagRef maceFollowUsePredictorLine = flagBuilder(maceFollow.add("predict-line"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceFollowStartPredictDistance = doubleBuilder(maceFollow.add("start-predict-distance"))
+            .defaultValue(10.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final DoubleRef maceFollowPredictTicksPerDistance = doubleBuilder(
+                    maceFollow.add("predict-ticks-per-distance"))
+            .defaultValue(0.5D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final DoubleRef maceFollowMaxPredictionTicks = doubleBuilder(maceFollow.add("max-prediction-ticks"))
+            .defaultValue(3.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef continuePullupIfCannotChaseTarget = flagBuilder(
+                    maceFollow.add("continue-pull-up-if-can-not-target-prediction"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    // todo:
+    public final FlagRef followAntiCenter = flagBuilder(maceFollow.add("follow-anti-center"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final ModulePath spear = elytraBot.add("spear-mode");
+
+    public final IntRef spearPullawayCooldown = intBuilder(spear.add("cooldown"))
+            .defaultValue(6)
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final DoubleRef spearMinRange = doubleBuilder(spear.add("min-range"))
+            .defaultValue(1.0D)
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final DoubleRef spearActiveRange = doubleBuilder(spear.add("active-range"))
+            .defaultValue(8.0D)
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final FlagRef spearEnableNearPassthroughFeature = builder(
+                    spear.add("enable-nearby-pass-through"), Boolean.class)
+            .defaultValue(true)
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final FlagRef spearEscapingPulloutChaseHorizontal = builder(
+                    spear.add("enable-escaping-chase-horizontal"), Boolean.class)
+            .defaultValue(true)
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final FlagRef spearEscapingPulloutChaseVertical = builder(
+                    spear.add("enable-escaping-chase-vertical"), Boolean.class)
+            .defaultValue(true)
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final ModulePath angleOptimize = elytraBot.add("angle-optimizing-flight");
+
+    {
+        portConfigs(elytraBot.add("combat-angle-optimize"), angleOptimize.add("combat-angle-optimize-pullup"));
+        portConfigs(elytraBot, angleOptimize, "combat-angle-optimize-follow");
+        portConfigs(elytraBot, angleOptimize, "combat-angle-optimize-range");
+        portConfigs(
+                elytraBot.add("combat-angle-optimize-radical"),
+                angleOptimize.add("combat-angle-optimize-radical-pullup"));
+        portConfigs(elytraBot, angleOptimize, "combat-angle-optimize-radical-pull-up-optimize-range");
+        portConfigs(
+                elytraBot.add("combat-angle-optimize-radical-follow"),
+                angleOptimize.add("combat-angle-optimize-follow-pitch-limit"));
+        portConfigs(
+                elytraBot.add("combat-pull-up-angle-optimize"),
+                angleOptimize.add("combat-angle-optimize-pullup-persistent-direction"));
+    }
+
+    public final FlagRef angleOptimizePullUp = builder(angleOptimize.add("combat-angle-optimize-pullup"), Boolean.class)
+            .defaultValue(false)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final FlagRef angleOptimizeAxisXZPullupOut = builder(
+                    angleOptimize.add("combat-angle-optimize-xz-pullup-out"), Boolean.class)
+            .defaultValue(true)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final DoubleRef angleOptimizeAxisXZOutRange = doubleBuilder(
+                    angleOptimize.add("combat-angle-optimize-xz-pullup-out-range"))
+            .defaultValue(30.0D)
+            .validator(Configs.doubleRange(0.0D, Double.MAX_VALUE))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final FlagRef angleOptimizeAxisXZPulluIn = builder(
+                    angleOptimize.add("combat-angle-optimize-xz-pullup-in"), Boolean.class)
+            .defaultValue(false)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final DoubleRef angleOptimizeAxisXZInRange = doubleBuilder(
+                    angleOptimize.add("combat-angle-optimize-xz-pullup-in-range"))
+            .defaultValue(12.0D)
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+    // 这个傻逼玩意， 代表的是 激进的拉升优化
+
+    public final FlagRef angleOptimizeRadicalPullup = flagBuilder(
+                    angleOptimize.add("combat-angle-optimize-radical-pullup"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+    // 直接往外拉
+
+    public final NBTRef<OptionalPrimitive<Double>> angleOptimizePullRange = builder(
+                    angleOptimize.add("combat-angle-optimize-radical-pull-up-optimize-range"),
+                    OptionalPrimitive.DOUBLE_TYPE)
+            .defaultValue(new OptionalPrimitive<>(false, NBTTypes.DOUBLE_TYPE, 20.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final FlagRef angleOptimizeFollow = builder(angleOptimize.add("combat-angle-optimize-follow"), Boolean.class)
+            .defaultValue(false)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+    public final NBTRef<LabelVec3> angleOptimizeFollowRange = builder(
+                    angleOptimize.add("combat-angle-optimize-range"), LabelVec3.class)
+            .defaultValue(new LabelVec3(
+                    "widget.elytra-bot.angle.normal-flight",
+                    "widget.elytra-bot.angle.spear-flight",
+                    "widget.elytra-bot.angle.anti-spear-flight",
+                    new Vec3(4.0, 4.0, 4.0)))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    // 这个傻逼玩意 代表的是激进的追击角度优化是否有角度限制（在垂直向下的时候禁用角度优化）
+    public final NBTRef<OptionalPrimitive<Double>> angleOptimizeFollowPitchLimit = builder(
+                    angleOptimize.add("combat-angle-optimize-follow-pitch-limit"), OptionalPrimitive.DOUBLE_TYPE)
+            .defaultValue(new OptionalPrimitive<>(true, NBTTypes.DOUBLE_TYPE, 75.0D))
+            .validator(s -> s.getValue() >= 0.0D && s.getValue() <= 90.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    // 这个傻逼玩意。在拉高的时候会来回摆。非常的炫酷(何意味
+
+    public final NBTRef<OptionalPrimitive<Double>> pullupPersistentDirection = builder(
+                    angleOptimize.add("combat-angle-optimize-pullup-persistent-direction"),
+                    OptionalPrimitive.DOUBLE_TYPE)
+            .defaultValue(new OptionalPrimitive<>(false, NBTTypes.DOUBLE_TYPE, 6.0D))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final FlagRef spearHideAngleOptimize = flagBuilder(angleOptimize.add("combat-angle-optimize-when-spear"))
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA) && ElytraExtra.INSTANCE.autoRescale.get())
+            .build();
+
+    public final DoubleRef spearChaseOptimizeAngle = doubleBuilder(
+                    angleOptimize.add("combat-angle-optimize-spear-range"))
+            .defaultValue(10.0D)
+            .build();
+
+    public final ModulePath antiSpear = elytraBot.add("anti-spear-settings");
+
+    {
+        portConfigs(elytraBot, antiSpear, "fly-anti-spear");
+        portConfigs(elytraBot, antiSpear, "fly-anti-spear-when-pull-up");
+        portConfigs(elytraBot, antiSpear, "fly-anti-spear-disable-when-using-spear");
+        portConfigs(elytraBot, antiSpear, "fly-anti-spear-after-angle");
+        portConfigs(elytraBot, antiSpear, "fly-anti-spear-use-spear-reset-when-follow");
+    }
+
+    public final NBTRef<OptionalPrimitive<Double>> flyAntiSpear = builder(
+                    antiSpear.add("fly-anti-spear"), OptionalPrimitive.DOUBLE_TYPE)
+            .defaultValue(new OptionalPrimitive<>(true, NBTTypes.DOUBLE_TYPE, 1.0D))
+            .show(() -> mode.get().isNotIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final DoubleRef flyAntiSpearRange = doubleBuilder(antiSpear.add("fly-anti-spear-range"))
+            .defaultValue(9.0D)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final NBTRef<OptionalPrimitive<Double>> flyAntiSpearWhenPullup = builder(
+                    antiSpear.add("fly-anti-spear-when-pull-up"), OptionalPrimitive.DOUBLE_TYPE)
+            .defaultValue(new OptionalPrimitive<>(false, NBTTypes.DOUBLE_TYPE, 1.0D))
+            .show(() -> mode.get().isNotIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final DoubleRef flyAntiSpearPullupRange = doubleBuilder(antiSpear.add("fly-anti-spear-pull-up-range"))
+            .defaultValue(9.0D)
+            .show(() -> (mode.get().isNotIn(Mode.SPEAR_ARUA)))
+            .validator(Configs.doubleRange(-100.0D, 100.0D))
+            .build();
+
+    public final FlagRef flyAntiSpearDisableWhenSpear = flagBuilder(
+                    antiSpear.add("fly-anti-spear-disable-when-using-spear"))
+            .show(() -> mode.get().isNotIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public final FlagRef flyAntiSpearOnlyWhenPredictedHit = flagBuilder(
+                    antiSpear.add("fly-anti-spear-use-predictor-to-predict-hit"))
+            .show(() -> (mode.get().isNotIn(Mode.SPEAR_ARUA)))
+            .build();
+
+    public final FlagRef flyAntiSpearPullupWhenPredictHit = flagBuilder(
+                    antiSpear.add("fly-anti-spear-pull-up-when-predict-hit"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef flyAntiSpearRevertFlyWhenPredictHit = flagBuilder(
+                    antiSpear.add("fly-anti-spear-revert-direction-when-predict-hit"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef flyAntiSpearRotateFlyWhenPredictHit = flagBuilder(
+                    antiSpear.add("fly-anti-spear-rotate-direction-when-predict-hit"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef flyAntiSpearAfterAngle = builder(antiSpear.add("fly-anti-spear-after-angle"), Boolean.class)
+            .defaultValue(true)
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef flyAntiSpearUseSpearResetWhenFollow = flagBuilder(
+                    antiSpear.add("fly-anti-spear-use-spear-reset-when-follow"))
+            .show(() -> mode.get().isIn(Mode.MACE_ARUA))
+            .build();
+
+    public final FlagRef spearAntiSpearPullOverWhenPredictHit = flagBuilder(
+                    antiSpear.add("spear-anti-spear-pull-over-when-predict-hit"))
+            .show(() -> mode.get().isIn(Mode.SPEAR_ARUA))
+            .build();
+
+    public void onSwitch() {
+        mode.next();
+        logI18N("message.module.elytra-bot.mode-switch", mode.get().getDisplay());
+    }
+
+    public void registerAll() {
+        super.registerAll();
+        registerListener(Listener.getPreTick(), this::onPreTick);
+        registerListener(Listener.getCustomListener().getChannel(ElytraMotion.class), this::onElytraChase);
+        registerListener(Listener.getPacketPoint().getChannel(PlayerInteractEntityC2SPacket.class), this::onAttack);
+        registerListener(Listener.getPreHandleInputEvents(), this::onInputEvent);
+        registerListener(Listener.getPacketPoint().getChannel(EntityStatusS2CPacket.class), this::onEntityStatus);
+        registerListener(RenderListener.getRender3DEvent(), this::onRender);
+        if (SlimefunHelper.DEV_ENV) {
+            registerListener(RenderListener.getRender2DEvent(), this::onDebugRender);
+        }
+        registerListener(Listener.getPacketPoint().getChannel(EntityDamageS2CPacket.class), this::onEntityDamage);
+        registerListener(Listener.getEntityPostTickListener().getChannel(EntityType.PLAYER), this::onPostPlayerMove);
+    }
+
+    @Override
+    public void addCustomWidgets(
+            Consumer<DrawableWidget> acceptor,
+            int dx,
+            int dy,
+            int dblank,
+            me.matl114.gui.interfaces.ElementFactory factory) {
+        super.addCustomWidgets(acceptor, dx, dy, dblank, factory);
+        var widget = factory.createTitle("widget.attack.attack.use-argument", 0, dblank, dx, dy);
+        acceptor.accept(new DynamicContentWidget<>(
+                () -> {
+                    return mode.get().isIn(Mode.MACE_ARUA) ? widget : null;
+                },
+                0,
+                0));
+    }
+
+    Entity target;
+
+    Vec3d getCurrentSyncedPos() {
+        return EntityInternalAccess.of(target).getPositionPredictor().getCurrentSyncedPos();
+    }
+
+    Vec3d getCurrentPos() {
+        return target.getPos(); // EntityInternalAccess.of(target).getPositionPredictor().getCurrentPos();
+    }
+
+    @Nullable
+    AbstractBotBehaviour currentBehaviour;
+
+    final AbstractBotBehaviour defaultBehaviour = new Follower().setBase(this);
+    final AbstractBotBehaviour maceArua = new MaceArua().setBase(this);
+    final AbstractBotBehaviour maceAruaGround = new MaceAuraGround().setBase(this);
+    final AbstractBotBehaviour spearArua = new SpearAura().setBase(this);
+
+    public boolean canControlFlight() {
+        return enable.get()
+                && autoControl.get()
+                && currentBehaviour != null
+                && currentBehaviour.movementDirection != null
+                && currentBehaviour.movementDirection.speed() > 1E-9;
+    }
+
+    Entity lastTarget;
+    TargetAction currentAction;
+    boolean currentInCombatRange;
+    boolean currentOnGround;
+    boolean heightLimitEnvironment = false;
+
+    public boolean isNoPullUpEnvironment() {
+        return heightLimitEnvironment || currentOnGround;
+    }
+
+    public boolean isTargetUsingSpear() {
+        return target instanceof PlayerEntity otherShit && SpearEnhance.isUsingSpear(otherShit);
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+    }
+
+    public AbstractBotBehaviour getBehaviour() {
+        if (enable.get()) {
+            return switch (mode.get()) {
+                case FOLLOW -> defaultBehaviour;
+                case MACE_ARUA -> isNoPullUpEnvironment() ? maceAruaGround : maceArua;
+                case SPEAR_ARUA -> spearArua;
+            };
+        } else {
+            return null;
+        }
+    }
+
+    public void onPreTick() {
+        var lastBehaviour = currentBehaviour;
+        currentBehaviour = getBehaviour();
+        if (currentBehaviour != lastBehaviour) {
+            if (lastBehaviour != null) {
+                lastBehaviour.onDisable();
+            }
+            if (currentBehaviour != null) {
+                currentBehaviour.onEnable();
+            }
+        }
+        if (checkNull()) return;
+        if (currentBehaviour != null) {
+            heightLimitEnvironment = mc.world.getDimension().hasCeiling()
+                    && mc.player.getY()
+                            < mc.world.getDimension().minY()
+                                    + mc.world.getDimension().logicalHeight();
+            refreshTarget();
+            updateTargetAction();
+            currentBehaviour.movementDirection = new ElytraMotion(
+                    ElytraExtra.INSTANCE.autoRescale.get() ? ElytraExtra.INSTANCE.autoRescaleAl.get() : null,
+                    new Vec2f(mc.player.getPitch(), mc.player.getYaw()),
+                    0,
+                    10.0D);
+            currentBehaviour.onUpdate();
+        }
+    }
+
+    public void onPostPlayerMove(Event<PlayerEntity> event) {
+        if (event.context == mc.player && currentBehaviour != null) {
+            currentBehaviour.onPostPlayerTick();
+        }
+    }
+
+    public double combatRange() {
+        return (target instanceof PlayerEntity pl && SpearEnhance.isUsingSpear(pl))
+                ? combatSpearRange.get()
+                : combatMaceRange.get();
+    }
+
+    public void updateTargetAction() {
+        if (target != lastTarget) {
+            lastTarget = target;
+            currentAction = null;
+        }
+        if (target != null) {
+
+            // initialize pos
+            double combatRange = combatRange();
+            currentInCombatRange = TargetSelector.INSTANCE.isWithinAttackRange(mc.player.getPos(), target, combatRange);
+            currentOnGround = target.isOnGround() || CollisionUtil.isEntitySupported(target);
+            if (target instanceof PlayerEntity pl) {
+                // speed < 1, we can easily handle this speed
+                var predictor = EntityInternalAccess.of(pl).getPositionPredictor();
+                if (currentOnGround || !(predictor instanceof PredictorImpl impl)) {
+                    currentAction = TargetAction.SLOW_SPEED;
+                } else {
+                    List<PredictorImpl.KnownPosition> knownPositions = impl.getLastKnownPositions(3);
+                    if (knownPositions.size() < 2) {
+                        // 数据不足，默认行为（可改为 TOWARDS 或不做处理）
+                        currentAction = TargetAction.CIRCLING;
+                    } else {
+                        int currentTick = Tasks.getTick();
+                        // 1. 最早的点（索引0）是否在10 tick之前
+                        PredictorImpl.KnownPosition oldest = knownPositions.get(0);
+                        if (currentTick - oldest.tick() > 20) {
+                            currentAction = TargetAction.AFK;
+                        } else {
+                            // 相邻点距离检查
+                            Vec3d pos0 = oldest.vec3d();
+                            Vec3d pos1 = knownPositions.get(1).vec3d();
+                            Vec3d pos2 = knownPositions.get(2).vec3d();
+
+                            double dist01 = pos0.distanceTo(pos1);
+                            double dist12 = pos1.distanceTo(pos2);
+                            if (dist01 < 1E-6 && dist12 < 1E-6) {
+                                currentAction = TargetAction.AFK;
+                            }
+                            // 2. 若相邻两点距离小于1.5，判定为SLOW_SPEED
+                            else if (dist01 < 0.75 && dist12 < 0.75) {
+                                currentAction = TargetAction.SLOW_SPEED;
+                            } else if (knownPositions.size() >= 3) {
+                                // 3. 计算向量 ab 和 bc 的夹角
+                                Vec3d ab = pos1.subtract(pos0);
+                                Vec3d bc = pos2.subtract(pos1);
+                                double dot = ab.dotProduct(bc);
+                                double magAB = ab.length();
+                                double magBC = bc.length();
+                                double angleRad = Math.acos(Math.min(1.0, Math.max(-1.0, dot / (magAB * magBC))));
+                                double angleDeg = Math.toDegrees(angleRad);
+
+                                if (angleDeg < 60.0) {
+                                    // 方向变化小，判断朝向玩家还是远离玩家
+                                    Vec3d playerPos = mc.player.getPos();
+                                    // 使用从最新点(pos2)指向玩家的向量
+                                    Vec3d toPlayer = playerPos.subtract(pos2);
+                                    // 如果 bc 方向（移动方向）与指向玩家的方向夹角小于90度，视为向玩家靠近
+                                    double moveDot = bc.normalize().dotProduct(toPlayer.normalize());
+                                    if (moveDot > 0) {
+                                        currentAction = TargetAction.TOWARDS; // 向我们来
+                                    } else {
+                                        currentAction = TargetAction.ESCAPING; // 离我们去
+                                    }
+                                } else {
+                                    currentAction = TargetAction.CIRCLING;
+                                }
+                            } else {
+                                // 点不足3个，默认行为
+                                currentAction = TargetAction.TOWARDS;
+                            }
+                        }
+                    }
+                }
+            } else {
+                currentAction = TargetAction.SLOW_SPEED;
+            }
+        }
+    }
+
+    public void onRender(Event<Render3D> event) {
+        if (enable.get() && render.get()) {
+            RenderUtils.startDrawVirtual(event.context.stack());
+            try {
+                MatrixStack stack = event.context.stack();
+                if (currentBehaviour != null) {
+                    Vec3d targetRender = currentBehaviour
+                            .movementDirection
+                            .rotation()
+                            .multiply(currentBehaviour.movementDirection.speed())
+                            .add(mc.player.getPos());
+                    if (targetRender != null) {
+                        RenderUtils.drawOutlinedBox(
+                                stack,
+                                targetRender.add(RenderTasks.FROM),
+                                targetRender.add(RenderTasks.TO),
+                                Color.MAGENTA);
+                    }
+                }
+
+            } finally {
+                RenderUtils.stopDrawVirtual(event.context.stack());
+            }
+        }
+    }
+
+    public void onDebugRender(Event<Render2D> eventVDraw) {
+        if (enable.get() && render.get() && currentBehaviour != null && target != null) {
+            var vdraw = eventVDraw.context.drawContext();
+            vdraw.getMatrices().pushMatrix();
+            vdraw.getMatrices().translate(200, 200);
+            vdraw.drawText(
+                    vdraw.getTextDrawer(),
+                    "Action: %s, Combating: %s".formatted(currentAction, String.valueOf(currentInCombatRange)),
+                    0,
+                    0,
+                    -1,
+                    false);
+            vdraw.getMatrices().popMatrix();
+        }
+    }
+
+    public void refreshTarget() {
+        if (!EntityUtils.isEntityValid(target)
+                || target.getPos().squaredDistanceTo(mc.player.getPos()) > targetRange.get()) {
+            target = null;
+        }
+        if (target == null || dynamicTarget.get()) {
+            target = currentBehaviour != null ? currentBehaviour.searchTarget() : null;
+        }
+    }
+
+    private boolean shouldUseMaceFix() {
+        if (maceFix.get() && mc.player.isFallFlying() && !ElytraExtra.INSTANCE.isCurrentArmorGliding()) {
+            if (ElytraExtra.INSTANCE.maceFixMode.get().test(s -> s.get().isIn(BypassMode.NO_BYPASS))) {
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    //    private boolean isConsideredAsAttackableEntity(Entity entity) {
+    //        if (!(entity instanceof PlayerEntity) && playerOnly.get()) {
+    //            return false;
+    //        }
+    //        var raycastResult = RaycastUtils.raycastSolidBlockResult(mc.player, mc.player.getPos(), entity.getPos());
+    //        if (raycastResult == null || raycastResult.getType() == HitResult.Type.MISS) {
+    //            return true;
+    //        }
+    //        Vec3d hitPoint = raycastResult.getPos();
+    //        return TargetSelector.INSTANCE.isWithinAttackRange(
+    //                hitPoint, entity.getBoundingBox(), CombatExtra.INSTANCE.getAttackAtTargetRange(entity));
+    //    }
+
+    public void onElytraChase(Event<EventContainer<ElytraMotion>> event) {
+        if (enable.get()) {
+            AbstractBotBehaviour behaviour = currentBehaviour;
+            if (behaviour != null) {
+                if (onlyWhenNoWASD.get()) {
+                    PlayerInputUtils.Input input = PlayerInputUtils.of(mc.options);
+                    if (input.hasMovementControl()) {
+                        behaviour.onPauseControl();
+                        return;
+                    }
+                }
+                behaviour.onElytra(event);
+            }
+        }
+    }
+
+    public void onAttack(Event<PlayerInteractEntityC2SPacket> attack) {
+        if (enable.get()
+                && currentBehaviour != null
+                && PlayerInteractEntityC2SPacketAccess.of(attack.context).isAttack()) {
+            Entity entity = mc.world.getEntityById(
+                    PlayerInteractEntityC2SPacketAccess.of(attack.context).getEntityId());
+            if (entity != null) {
+                currentBehaviour.onAttack(entity);
+            }
+        }
+    }
+
+    public void onInputEvent(Event<Void> event) {
+        if (enable.get()) {
+            AbstractBotBehaviour behaviour = currentBehaviour;
+            if (behaviour != null) {
+                behaviour.onInputEvent(event);
+            }
+        }
+    }
+
+    public void onEntityStatus(Event<EntityStatusS2CPacket> statusS2CPacketEvent) {
+        var statusS2CPacket = statusS2CPacketEvent.context;
+        if (currentBehaviour instanceof HitListener sp
+                && mc.player != null
+                && mc.world != null
+                && enable.get()
+                && statusS2CPacket.getEntity(mc.world) == mc.player
+                && statusS2CPacket.getStatus() == VDataFlag.ENTITY_STATUS_KINETIC_ATTACK) {
+            if (logSpearHit.get() && mode.get().isIn(Mode.SPEAR_ARUA)) {
+                logI18N("message.module.elytra-bot.spear-hit");
+            }
+            sp.onHit(HitListener.HIT_SPEAR);
+        }
+    }
+
+    public void onEntityDamage(Event<EntityDamageS2CPacket> e) {
+        if (checkNull()) return;
+        if (currentBehaviour instanceof HitListener sp
+                && enable.get()
+                && e.context.sourceCauseId() == mc.player.getId()
+                && mc.world.getEntityById(e.context.entityId()) == target) {
+            var source = e.context.sourceType().getKey().orElse(null);
+            if (DamageUtils.isType(source, "mace_smash")) {
+                // we trigger a mace smash
+                sp.onHit(HitListener.HIT_MACE);
+                return;
+            }
+            sp.onHit(HitListener.HIT_ATTACK);
+        }
+    }
+
+    public static interface HitListener {
+        static int HIT_ATTACK = 0;
+        static int HIT_MACE = 1;
+        static int HIT_SPEAR = 2;
+
+        public void onHit(int type);
+    }
+
+    @Setter
+    @Accessors(chain = true)
+    public abstract static class AbstractBotBehaviour {
+        // todo： add target anaylsis
+
+        ElytraBot base;
+        ElytraMotion movementDirection = new ElytraMotion(null, new Vec3d(0, 1, 0), 0, 10.0D);
+        // todo: update target considering blocks , can we async calculate to let
+        // use pitch search
+
+        // todo: calculate reachable, if entity can reach reach distance
+        public void onElytra(Event<EventContainer<ElytraMotion>> event) {
+            if (movementDirection != null && movementDirection.speed() != 0) {
+                ElytraMotion motion = event.context.getValue();
+                motion.algorithm(movementDirection.algorithm())
+                        .rotation(movementDirection.rotationAngles())
+                        .speed(movementDirection.speed());
+            }
+        }
+
+        protected void setRotation(Vec3d movement) {
+            Vec2f rotation = movement.horizontalLengthSquared() < 1E-12
+                    ? new Vec2f(movement.y >= 0.0 ? -90.0F : 90.0F, mc.player.getYaw())
+                    : EntityUtils.rotationToPitchYaw(movement.normalize());
+            movementDirection.rotation(rotation);
+        }
+
+        protected void setRotation(Vec2f rotation) {
+            movementDirection.rotation(rotation);
+        }
+
+        protected void setRotation(float pitch, float yaw) {
+            movementDirection.rotation(pitch, yaw);
+        }
+
+        protected void setMovement(Vec3d movement, double speed) {
+            setRotation(movement);
+            movementDirection.speed(speed);
+        }
+
+        protected void setSpeed(double speed) {
+            movementDirection.speed(speed);
+        }
+
+        protected void resetSpeedOnStateChange(StateMachine stateMachine, int... states) {
+            for (int state : states) {
+                stateMachine.registerListener(state, isOn -> {
+                    if (isOn) {
+                        setSpeed(0);
+                    }
+                });
+            }
+        }
+
+        protected void update(Function<Vec2f, Vec2f> updater) {
+            movementDirection.rotation(updater.apply(movementDirection.rotationAngles()));
+        }
+
+        protected Vec2f calculateBestPullupSpeed(ElytraMotion movement) {
+            ElytraExtra.Al al = movement.algorithm();
+            return al == null
+                    ? movement.rotationAngles()
+                    : ElytraOptimizeUtils.calculateBestPullupSpeed(movement.pitch(), movement.yaw(), al);
+        }
+
+        protected Vec2f calculateBestDownForwardSpeed(ElytraMotion movement, boolean natural, boolean downward) {
+            ElytraExtra.Al al = movement.algorithm();
+            return al == null
+                    ? movement.rotationAngles()
+                    : ElytraOptimizeUtils.calculateBestDownForwardSpeed(
+                            movement.pitch(), movement.yaw(), al, natural, downward);
+        }
+
+        protected Vec3d calculateTargetDirection(Vec3d predictorPos) {
+            if (movementDirection.algorithm() == null) {
+                //
+                if (SpearEnhance.isHoldingSpear(mc.player)) {
+                    return (predictorPos
+                                    .add(0, base.target.dimensions.height() * 2 / 3, 0)
+                                    .subtract(mc.player.getEyePos()))
+                            .normalize();
+                } else {
+                    return predictorPos.subtract(mc.player.getPos()).normalize();
+                }
+            } else {
+                Vec3d legacy;
+                Vec3d forward;
+                if (SpearEnhance.isHoldingSpear(mc.player)) {
+                    Vec3d targetPos = predictorPos.add(0, base.target.dimensions.height() * 2 / 3, 0);
+                    legacy = targetPos.subtract(mc.player.getEyePos());
+                    forward = ElytraOptimizeUtils.calculateLookTowardsTargetV3Direction(
+                            movementDirection.algorithm(), legacy, 1.7);
+                } else {
+                    legacy = predictorPos.subtract(mc.player.getPos());
+                    forward = ElytraOptimizeUtils.calculateTowardsTargetV3Direction(
+                            movementDirection.algorithm(), legacy, 1.7);
+                }
+                if (legacy.dotProduct(forward) < 0) {
+                    return legacy;
+                } else {
+                    return forward;
+                }
+            }
+        }
+
+        protected Vec3d simulateMovement(ElytraMotion motion) {
+            if (motion.algorithm() == null || motion.algorithm().isIn(ElytraExtra.Al.V1, ElytraExtra.Al.V2)) {
+                return motion.rotation().multiply(1.7);
+            } else {
+                var pitchYaw = EntityUtils.rotationToPitchYaw(motion.rotation().normalize());
+                return ElytraOptimizeUtils.simulateAxisLimitSpeed(
+                        motion.algorithm(), motion.rotation().multiply(1.7), pitchYaw.x, pitchYaw.y);
+            }
+        }
+
+        public void onPostPlayerTick() {}
+
+        public Entity searchTarget() {
+            return CombatTasks.getTargetSelector()
+                    .searchAttackEntity(
+                            base.targetRange.get(),
+                            true,
+                            base.playerOnly.get() ? (e) -> e instanceof PlayerEntity : null);
+        }
+
+        public synchronized void onUpdate() {}
+
+        public void onInputEvent(Event<Void> eventInput) {}
+
+        public synchronized void onAttack(Entity entity) {}
+
+        public abstract void onEnable();
+
+        public abstract void onDisable();
+
+        public void onPauseControl() {}
+
+        protected boolean willUseAntiSpear(OptionalPrimitive<Double> op, double distance, Vec3d predictorPos) {
+            return (op.isPresent()
+                    && (!(base.flyAntiSpearDisableWhenSpear.get() && SpearEnhance.isUsingSpear(mc.player)))
+                    && Math.abs(op.getValue()) > 1E-6
+                    && base.isTargetUsingSpear()
+                    && mc.player.getPos().squaredDistanceTo(predictorPos) < MathUtils.s2(distance)
+                    && (!base.flyAntiSpearOnlyWhenPredictedHit.get() || predictMayHitAntiSpear(predictorPos)));
+        }
+
+        protected boolean predictMayHitAntiSpear(Vec3d predictor) {
+            Box originalBox = mc.player.getBoundingBox();
+            Vec3d newVec3d = simulateMovement(movementDirection);
+            Box currentBox = originalBox.offset(newVec3d).expand(0.3, 0.3, 0.3);
+            Vec3d originalVec = base.getCurrentSyncedPos();
+            Vec3d predictorMovement = predictor.subtract(originalVec).normalize();
+            Vec3d test = predictorMovement.multiply(12);
+            Vec3d originalEye = originalVec.add(0, base.target.dimensions.eyeHeight(), 0);
+            Vec3d predictorEye = predictor.add(0, base.target.dimensions.eyeHeight(), 0);
+            if (currentBox.raycast(originalEye, predictorEye).isEmpty()
+                    && currentBox.raycast(predictorEye, predictorEye.add(test)).isEmpty()) {
+                return false;
+            }
+            return true;
+        }
+
+        protected void antiSpear(OptionalPrimitive<Double> op) {
+            ;
+            Vec3d originalLookHorizontal =
+                    movementDirection.rotation().withAxis(Direction.Axis.Y, 0).normalize();
+            if (originalLookHorizontal.lengthSquared() < 1E-2) {
+                originalLookHorizontal = new Vec3d(1, 0, 0);
+            }
+            Vec3d vertical = new Vec3d(0, 1, 0);
+            Vec3d side = vertical.crossProduct(originalLookHorizontal).normalize();
+            Vec3d origin = movementDirection.rotation();
+
+            Vec3d multiply = side.multiply(op.getValue());
+            setRotation(origin.add(multiply));
+        }
+    }
+
+    public static class Follower extends AbstractBotBehaviour {
+        // todo: add in-hole behaviour, add hole-esp related, add landing
+
+        @Override
+        public Entity searchTarget() {
+            return CombatTasks.getTargetSelector().searchAttack(base.targetRange.get(), true, 0, this::canBeAttack);
+        }
+
+        public boolean canBeAttack(Entity entity) {
+            if (entity instanceof PlayerEntity player
+                    && player != mc.player
+                    && base.followFriend.get()
+                    && !TargetSelector.INSTANCE.isNotFriend(player)) {
+                return true;
+            } else {
+                return TargetSelector.INSTANCE.canAttack(entity)
+                        && (!base.playerOnly.get() || entity instanceof PlayerEntity);
+            }
+        }
+
+        @Override
+        public synchronized void onUpdate() {
+            super.onUpdate();
+            if (base.target != null) {
+                setMovement(base.getCurrentPos().subtract(mc.player.getPos()), 10);
+            } else {
+                setSpeed(0);
+            }
+        }
+
+        @Override
+        public void onEnable() {}
+
+        @Override
+        public void onDisable() {}
+    }
+
+    public abstract static class AbstractMaceBehaviour extends AbstractBotBehaviour implements HitListener {
+        static final int STATE_PULL_UP = 1;
+        static final int STATE_FOLLOW = 2;
+        static final int STATE_WAIT_ATTACK = 3;
+        static final int STATE_NONE = 0;
+        public StateMachine stateMachine;
+        int startWaitAttack = -1;
+        double maxHeightInAttack = Double.MIN_VALUE;
+        double startPullUp = Double.MIN_VALUE;
+        int startPullUpTick = 0;
+
+        public AbstractMaceBehaviour() {
+            stateMachine = new StateMachine(
+                    STATE_NONE,
+                    this::onCondition,
+                    this::onStateNone,
+                    this::onStatePullUp,
+                    this::onStateFollow,
+                    this::onStateWaitAttack);
+            resetSpeedOnStateChange(stateMachine, STATE_NONE, STATE_PULL_UP, STATE_FOLLOW, STATE_WAIT_ATTACK);
+            stateMachine.registerListener(STATE_WAIT_ATTACK, this::onStartWaitAttack);
+            stateMachine.registerListener(STATE_PULL_UP, this::onStartPullUp);
+        }
+
+        public int onCondition(StateMachine machine, int state) {
+            if (base.target == null) {
+                machine.markForEndState();
+                setSpeed(0);
+                return STATE_NONE;
+            }
+            return state;
+        }
+
+        public int onStateNone(StateMachine machine) {
+            if (base.target != null) {
+                if (PlayerStateManager.INSTANCE.fallDistance > 4
+                        && mc.player.getPos().getY() > base.getCurrentPos().getY() + 4.0) {
+                    return STATE_FOLLOW;
+                }
+                return STATE_PULL_UP;
+            }
+            setSpeed(0);
+            machine.markForEndState();
+            return STATE_NONE;
+        }
+
+        public abstract int onStatePullUp(StateMachine machine);
+
+        public abstract int onStateFollow(StateMachine machine);
+        // compat delay attack shit, add cd,
+        public int onStateWaitAttack(StateMachine machine) {
+
+            if (base.currentAction != TargetAction.AFK && base.currentAction != TargetAction.SLOW_SPEED) {
+                machine.markForEndState();
+                return STATE_PULL_UP;
+            }
+            if (++startWaitAttack > 1) {
+                if (base.currentOnGround) {
+                    return STATE_NONE;
+                } else {
+                    return STATE_FOLLOW;
+                }
+            }
+            machine.markForEndState();
+            // stay!
+            Vec3d targetPos = base.maceUsePredictor.get()
+                    ? PositionPredict.INSTANCE
+                            .attackPredictArgument
+                            .get()
+                            .predict(base.target)
+                            .withAxis(Direction.Axis.Y, base.getCurrentPos().y)
+                    : base.getCurrentPos();
+            double lerpY = base.maceYLevelWeight.get();
+            double yLerp = targetPos.y * lerpY + base.getCurrentPos().y * (1.0D - lerpY);
+            targetPos = targetPos.withAxis(Direction.Axis.Y, yLerp);
+            setTargetToPlayer(targetPos);
+            if (movementDirection.rotation().y >= 0) {
+                return STATE_PULL_UP;
+            }
+            return STATE_WAIT_ATTACK;
+        }
+
+        protected abstract void setTargetToPlayerUpper(Vec3d predictor, double height);
+
+        protected abstract void setTargetToPlayer(Vec3d targetPos);
+
+        boolean thisTickStartFallFlying;
+
+        @Override
+        public synchronized void onUpdate() {
+            super.onUpdate();
+            this.thisTickStartFallFlying = ElytraExtra.INSTANCE.isThisTickGlideMovementServerSideGlide();
+            if (mc.player.isFallFlying() || mc.player.getAbilities().flying) {
+                maxHeightInAttack = Math.max(maxHeightInAttack, mc.player.getY());
+                stateMachine.step();
+                // Debug.info("State", stateMachine.getState(), "height", PlayerStateManager.INSTANCE.fallDistance);
+                // todo: consider cooldown, do not attack too fast
+                if (attackFlag) {
+                    if (base.target != null) {
+                        // anti shield
+                        boolean simpleAttack = shouldAttackSimple();
+                        boolean maceAttack = canAttackMace();
+                        if (simpleAttack) {
+                            // can not deal mace attack anyway
+                            Attack.AttackSettings settings = CombatTasks.getAttack()
+                                    .createAttackSettings()
+                                    .withMaceSwap(false);
+                            if (shouldUseAntiShield()) {
+                                settings = settings.withAntiShieldSwap(true).withFastBreakShieldSwap(Optional.empty());
+                            }
+                            CombatTasks.getAttack().attackEntity(base.target, settings);
+                        }
+                        if (maceAttack) {
+                            Attack.AttackSettings settings = Attack.INSTANCE.createAttackSettings();
+                            Attack.INSTANCE.attackEntity(
+                                    base.target, settings.withNoSwap().withMaceSwap(true));
+                            lastMaceAttackTick = Tasks.getTick();
+                            Debug.debug("[ElytraBot] Do mace attack here", Tasks.getTick());
+                        }
+                    }
+                    maxHeightInAttack = mc.player.getY();
+                    attackFlag = false;
+                }
+            } else {
+                stateMachine.setState(STATE_NONE);
+                setSpeed(0);
+            }
+            lastFallDistance = PlayerStateManager.INSTANCE.fallDistance;
+        }
+
+        @Override
+        public void onPostPlayerTick() {
+            super.onPostPlayerTick();
+            if (base.target != null
+                    && base.appendPostAttack.get()
+                    && !thisTickStartFallFlying
+                    && TargetSelector.INSTANCE.isWithinAttackRange(mc.player.getPos(), base.target)
+                    && canAttackMace()
+                    && shouldAttackMace()) {
+                Attack.AttackSettings settings = CombatTasks.getAttack().createAttackSettings();
+                Attack.INSTANCE.attackEntity(base.target, settings.withNoSwap().withMaceSwap(true));
+            }
+        }
+
+        public void onStartWaitAttack(boolean on) {
+            startWaitAttack = 0;
+        }
+
+        public void onStartPullUp(boolean on) {
+            if (on) {
+                startPullUp = mc.player.getY();
+                startPullUpTick = Tasks.getTick();
+            } else {
+                startPullUp = Double.MIN_VALUE;
+                startPullUpTick = 0;
+            }
+        }
+
+        public boolean shouldUseAntiShield() {
+            return Attack.shouldUseAntiShield(base.target);
+        }
+
+        public boolean shouldPullUpEating() {
+            return base.maceAttackConsiderUse.get()
+                    && CombatTasks.getAttackAura().checkEating();
+        }
+
+        public boolean shouldAttackSimple() {
+            boolean useAntiShield = shouldUseAntiShield();
+            if (useAntiShield) return true;
+            if (VItem.getInstance().isSpear(mc.player.getActiveItem())) return false;
+            if (!base.maceAttackUseSimple.get()) return false;
+            if ((mc.player.getAttackCooldownProgress(0.5F) > 0.95F)) {
+                if (base.maceAttackConsiderUse.get()
+                        && CombatTasks.getAttackAura().checkUsing()) {
+                    return false;
+                }
+                // auto mace, do not hit twice
+                if (Attack.INSTANCE.willUseMaceAttack(false)) {
+                    return false;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        public boolean shouldAttackMace() {
+            boolean cooldown =
+                    (lastMaceAttackSuccessTick < Tasks.getTick()) || Attack.INSTANCE.willUseMaceAttack(false);
+            return cooldown && PlayerStateManager.INSTANCE.fallDistance >= base.maceMinFallDistance.get();
+        }
+
+        public boolean canAttackMace() {
+            boolean cooldown = (lastMaceAttackSuccessTick < Tasks.getTick());
+            return Attack.INSTANCE.willUseMaceAttack(true)
+                    && (cooldown || PlayerStateManager.INSTANCE.fallDistance >= 1.5);
+        }
+
+        public synchronized void onPauseControl() {
+            stateMachine.setState(STATE_NONE);
+        }
+
+        boolean attackFlag = false;
+        int lastMaceAttackTick;
+        int lastMaceAttackSuccessTick;
+        double lastFallDistance;
+
+        protected Vec3d calculateTargetDirection(Vec3d predictorPos) {
+            if (base.shouldUseMaceFix()) {
+                if (movementDirection.algorithm() == null) {
+                    //
+                    if (SpearEnhance.isHoldingSpear(mc.player)) {
+                        return (predictorPos
+                                        .add(0, base.target.dimensions.height() * 2 / 3, 0)
+                                        .subtract(mc.player
+                                                .getPos()
+                                                .add(0, mc.player.getEyeHeight(EntityPose.STANDING), 0)))
+                                .normalize();
+                    } else {
+                        return predictorPos.subtract(mc.player.getPos()).normalize();
+                    }
+                } else {
+                    Vec3d legacy;
+                    Vec3d forward;
+                    if (SpearEnhance.isHoldingSpear(mc.player)) {
+                        Vec3d targetPos = predictorPos.add(0, base.target.dimensions.height() * 2 / 3, 0);
+                        legacy = targetPos.subtract(
+                                mc.player.getPos().add(0, mc.player.getEyeHeight(EntityPose.STANDING), 0));
+                        forward = ElytraOptimizeUtils.calculateLookTowardsTargetV3Direction(
+                                movementDirection.algorithm(), legacy, 1.7);
+                    } else {
+                        legacy = predictorPos.subtract(mc.player.getPos());
+                        forward = ElytraOptimizeUtils.calculateTowardsTargetV3Direction(
+                                movementDirection.algorithm(), legacy, 1.7);
+                    }
+                    if (legacy.dotProduct(forward) < 0) {
+                        return legacy;
+                    } else {
+                        return forward;
+                    }
+                }
+            } else {
+                return super.calculateTargetDirection(predictorPos);
+            }
+        }
+
+        public boolean tryPreSwapArmorForAttack() {
+            if (shouldAttackMace()
+                    && base.shouldUseMaceFix()
+                    && !ElytraExtra.INSTANCE.hasPendingFallFlyingReset()
+                    && Tasks.getTick() - PlayerStateManager.INSTANCE.lastStartGlidingTick
+                            >= base.maceSwapMinDelay.get()) {
+                Vec3d predictedPosition = PositionPredict.INSTANCE
+                        .attackPredictArgument
+                        .get()
+                        .predict0(base.target, base.maceSwapTargetPredictTicks.get());
+                double speed = PlayerStateManager.INSTANCE.lastKnownClientVelocity.length();
+                double predictingRange = base.macePreSwapSpeed.get().data().x()
+                        + base.macePreSwapSpeed.get().data().y() * speed;
+                double range = CombatTasks.getCombatExtra().getAttackAtTargetRange(base.target) + predictingRange;
+                if (TargetSelector.INSTANCE.isWithinAttackRange(
+                        mc.player.getPos(), base.target.dimensions.getBoxAt(predictedPosition), range)) {
+                    return ElytraExtra.INSTANCE.requestManualArmorSwapAndResetFallFlying(50);
+                }
+            }
+            return false;
+        }
+
+        public void scheduleAttack() {
+            attackFlag = true;
+        }
+        // todo: check mace swap
+
+        @Override
+        public void onEnable() {
+            stateMachine.setState(STATE_NONE);
+        }
+
+        @Override
+        public void onDisable() {}
+
+        @Override
+        public synchronized void onHit(int type) {
+            // pull up only when after mace attack to miss
+            if (lastMaceAttackTick > Tasks.getTick() - 5 && stateMachine.getState() != STATE_PULL_UP) {
+                lastMaceAttackSuccessTick = Tasks.getTick();
+                stateMachine.setState(STATE_PULL_UP);
+            }
+        }
+
+        @Override
+        public abstract void onAttack(Entity entity);
+    }
+
+    public static class MaceArua extends AbstractMaceBehaviour implements HitListener {
+
+        public int onStatePullUp(StateMachine machine) {
+            Vec3d testMovement = new Vec3d(0, 0.1, 0);
+            Vec3d simulation = MovTasks.simulateMovement(mc.player, mc.player.getPos(), testMovement, true);
+            boolean simulationHead = simulation.squaredDistanceTo(testMovement) > 1E-4;
+            boolean shouldForcePullUp = shouldPullUpEating();
+            Vec3d predictor = base.maceUsePredictor.get()
+                    ? PositionPredict.INSTANCE.attackPredictArgument.get().predict(base.target)
+                    : base.getCurrentPos();
+            double pullupHeight = base.maceHeight.get();
+            if (base.maceChaseFollowYBias.get()) {
+                double horizontalRange = mc.player.getPos().subtract(predictor).horizontalLength();
+                if (base.maceChaseFollowBiasStartHorizontalRange.get() < horizontalRange) {
+                    pullupHeight += base.maceChaseFollowBiasExtraHeightPerBlock.get()
+                            * (horizontalRange - base.maceChaseFollowBiasStartHorizontalRange.get());
+                }
+            }
+            if (shouldForcePullUp) {
+                setTargetToEat(predictor, simulationHead, pullupHeight);
+                machine.markForEndState();
+                return STATE_PULL_UP;
+            }
+            if (simulationHead) {
+                // can not pull up
+                return STATE_FOLLOW;
+            } else {
+                {
+                    double thresholdY =
+                            base.maceTryFollowUsePredictor.get() ? predictor.getY() : base.getCurrentPos().y;
+
+                    double targetY = thresholdY + pullupHeight;
+
+                    // check pulling time
+                    boolean mayFollow = (mc.player.getY() >= targetY)
+                            || (mc.player.getY() > thresholdY
+                                    && startPullUpTick != 0
+                                    && Tasks.getTick()
+                                            > base.maceRemainPullUpTick.get() + startPullUpTick + pullupHeight);
+                    setTargetToPlayerUpper(predictor, pullupHeight);
+                    if (!mayFollow) {
+                        machine.markForEndState();
+                        return STATE_PULL_UP;
+                    } else {
+                        return STATE_FOLLOW;
+                    }
+                }
+            }
+        }
+
+        boolean currentTargetUpFly = false;
+
+        public int onStateFollow(StateMachine machine) {
+            if (PlayerStateManager.INSTANCE.fallDistance < 1E-6 && lastFallDistance > 1E-6) {
+                // we trigger falldistance reset during chase
+                return STATE_PULL_UP;
+            }
+            // already reach the target
+            if (shouldPullUpEating()) {
+                return STATE_PULL_UP;
+            }
+            tryPreSwapArmorForAttack();
+            Vec3d targetPos = base.maceUsePredictor.get()
+                    ? PositionPredict.INSTANCE.attackPredictArgument.get().predict(base.target)
+                    : base.getCurrentPos();
+            double horizontalMovement = targetPos.subtract(base.getCurrentPos()).horizontalLength();
+            currentTargetUpFly = base.getCurrentPos().y + horizontalMovement * 1.0F < targetPos.y;
+            boolean mayAttack = shouldAttackSimple() || shouldAttackMace();
+            // use real bounding box for hit
+            boolean targetInRange = TargetSelector.INSTANCE.isWithinAttackRange(mc.player.getPos(), base.target);
+            // 限制高度 但是对面是往上飞的 不需要
+            if (mayAttack && targetInRange) {
+                setTargetToPlayer(targetPos);
+                scheduleAttack();
+                if (movementDirection.rotation().y >= 0) {
+                    return STATE_PULL_UP;
+                }
+                machine.markForEndState();
+                return STATE_FOLLOW;
+            } else {
+                Vec3d testMovement = new Vec3d(0, -0.1, 0);
+                Vec3d simulation = MovTasks.simulateMovement(mc.player, mc.player.getPos(), testMovement, true);
+                boolean simulationFeet = simulation.squaredDistanceTo(testMovement) > 1E-4;
+                // do not follow because no enough height and other people will overhead us
+                boolean pullUp = simulationFeet;
+                if (pullUp) {
+                    if (targetInRange) {
+                        setTargetToPlayer(targetPos);
+                        scheduleAttack();
+                        if (movementDirection.rotation().y >= 0) {
+                            return STATE_PULL_UP;
+                        }
+                        machine.markForEndState();
+                        return STATE_FOLLOW;
+                    } else {
+                        return STATE_PULL_UP;
+                    }
+                }
+                setTargetToPlayer(targetPos);
+                if (movementDirection.rotation().y >= 0) {
+                    return STATE_PULL_UP;
+                }
+            }
+            if (base.flyAntiSpearUseSpearResetWhenFollow.get()) {
+                SpearEnhance.INSTANCE.setForceSpearReset(true);
+            }
+            if (movementDirection.rotation().y >= 0) {
+                return STATE_PULL_UP;
+            }
+            machine.markForEndState();
+            return STATE_FOLLOW;
+        }
+
+        private void setTargetToEat(Vec3d predictor, boolean headSimulation, double height) {
+            if (headSimulation) {
+                Vec3d vec3d = base.getCurrentPos().subtract(mc.player.getPos());
+                if (vec3d.horizontalLength() > base.combatRange()) {
+                    setTargetToPlayerUpper(predictor, height);
+                } else {
+                    setMovement(new Vec3d(-vec3d.x, 0, -vec3d.z), 10);
+                }
+
+            } else {
+                setTargetToPlayerUpper(predictor, height);
+            }
+        }
+
+        protected void setTargetToPlayerUpper(Vec3d predictor, double height) {
+            if (base.macePullupUseV5.get()
+                    && mc.player.getPos().subtract(predictor).horizontalLength()
+                            <= base.macePullupUseV5Distance.get()) {
+                movementDirection.algorithm(ElytraExtra.Al.V5_PULLUP_ONLY);
+            }
+            Vec3d movement = null;
+            boolean onGroundSupport = base.currentOnGround;
+            boolean executeSmoothHideFlight = false;
+            boolean antiSpear = willUseAntiSpear(
+                            base.flyAntiSpearWhenPullup.get(), base.flyAntiSpearPullupRange.get(), predictor)
+                    && (mc.player.getY() > predictor.getY()
+                            || mc.player.getPos().subtract(predictor).horizontalLength() < base.combatSpearRange.get());
+            boolean yLow = predictor.getY() >= mc.player.getY();
+            if (base.combatSmoothFlightPullup.get() && !onGroundSupport) {
+                double combatRange = base.combatMaceRange.get();
+                if (base.combatSmoothCircleDynamicRangeByHeight.get().isPresent()) {
+                    Vec3 arguments =
+                            base.combatSmoothCircleDynamicRangeByHeight.get().getValue();
+                    double predictorYL = predictor.y - mc.player.getY();
+                    if (predictorYL > arguments.x()) {
+                        combatRange += Math.min(predictorYL - arguments.x(), arguments.z()) * arguments.y();
+                    }
+                }
+                if (yLow) {
+                    Vec3d center = base.target.dimensions.getBoxAt(predictor).getCenter();
+                    {
+                        double radius = combatRange + base.combatSmoothCircleExtraRange.get();
+                        Pair<Vec3d, Vec3d> tangents =
+                                MathUtils.getTangentWithSameXZ(center, radius, mc.player.getEyePos());
+                        Vec3d vec3d = tangents.getFirst();
+                        Vec3d vec3d2 = tangents.getSecond();
+                        Vec3d vec3d3 = vec3d.y < vec3d2.y ? vec3d2 : vec3d;
+                        // go upper not horizontal
+                        vec3d3 = vec3d3.add(0, 1E-2, 0);
+                        if (Math.abs(base.combatSmoothOutPullRatio.get()) > 1E-6
+                                && (base.combatSmoothOutPullRatioUseHorizontalDistance.get()
+                                                ? center.subtract(mc.player.getEyePos())
+                                                        .horizontalLengthSquared()
+                                                : center.squaredDistanceTo(mc.player.getEyePos()))
+                                        < MathUtils.s2(base.combatSmoothOutPullRatioEnableDistance.get())) {
+                            // 垂线
+                            vec3d3 = vec3d3.normalize();
+                            Vec3d delta = mc.player.getEyePos().subtract(center);
+                            Vec3d horizontalMul = new Vec3d(delta.x, 0, delta.z)
+                                    .normalize()
+                                    .multiply(base.combatSmoothOutPullRatio.get());
+                            vec3d3 = vec3d3.add(horizontalMul).normalize();
+                        }
+                        if (vec3d3.y > 0) {
+                            movement = vec3d3.normalize().multiply(10);
+                        }
+                        executeSmoothHideFlight =
+                                center.squaredDistanceTo(mc.player.getEyePos()) < MathUtils.s2(radius);
+                    }
+                }
+            }
+            if (movement == null && base.combatSmoothFlightPullupAttack.get() && !onGroundSupport) {
+                Vec3d direction = movementDirection.algorithm() != null
+                        ? predictor.subtract(mc.player.getPos()).normalize().multiply(10)
+                        : Vec3d.ZERO;
+                if (predictor.subtract(mc.player.getPos()).horizontalLength()
+                        < base.combatSmoothFlightPullupAttackMaxHorizontal.get()) {
+                    if (predictor.getY() + base.combatSmoothFlightPullupAttackMinRelativeY.get() > mc.player.getY()) {
+                        movement = new Vec3d(-direction.x, 10, -direction.z);
+                    } else if (predictor.getY() + base.combatSmoothFlightPullupAttackMaxRelativeY.get()
+                            > mc.player.getY()) {
+                        movement = new Vec3d(direction.x, 10, direction.z);
+                    }
+                }
+            }
+            if (movement == null) {
+                // normal pull up
+                movement = predictor
+                        .withAxis(Direction.Axis.Y, (predictor.getY() + (height)))
+                        .subtract(mc.player.getPos());
+                if (movement.length() < 5) {
+                    movement = movement.normalize().multiply(5);
+                }
+            }
+            if (base.pullupPersistentDirection.get().isPresent() && !onGroundSupport && !executeSmoothHideFlight) {
+                double horizontalDistance = movement.horizontalLength();
+                if (horizontalDistance > 1E-1) {
+                    Vec3d lastMovement = PlayerStateManager.INSTANCE.lastKnownRealMovementSpeed;
+                    Vec3d lastHorizontal = lastMovement.withAxis(Direction.Axis.Y, 0);
+                    double distance = base.pullupPersistentDirection.get().getValue();
+                    if (distance > horizontalDistance) {
+                        if (lastHorizontal.dotProduct(movement) < 0) {
+                            movement = movement.multiply(-1, 1, -1);
+                        }
+                    }
+                }
+            }
+            setMovement(movement, 10);
+            setSpeed(10);
+
+            if (!base.flyAntiSpearAfterAngle.get() && antiSpear) {
+                antiSpear(base.flyAntiSpearWhenPullup.get());
+            }
+            if (base.angleOptimizePullUp.get()) {
+                if (movementDirection.rotation().y > 1E-6) {
+                    double horizontal = mc.player.getPos().subtract(predictor).horizontalLength();
+                    Vec3d targetVec = mc.player.getPos().subtract(predictor).withAxis(Direction.Axis.Y, 0);
+                    boolean out = movementDirection.rotation().dotProduct(targetVec) > 0;
+
+                    if (base.angleOptimizeRadicalPullup.get()
+                            && !out
+                            && yLow
+                            && base.angleOptimizePullRange.get().isPresent()
+                            && horizontal < base.angleOptimizePullRange.get().getValue()) {
+                        Vec3d rotation = mc.player
+                                .getPos()
+                                .subtract(predictor)
+                                .withAxis(Direction.Axis.Y, 0)
+                                .normalize();
+                        double horizontal2 = Math.max(Math.abs(rotation.x), Math.abs(rotation.z));
+                        setRotation(rotation.withAxis(Direction.Axis.Y, horizontal2));
+                    } else {
+                        Vec3d rotation = movementDirection.rotation();
+                        double horizontal2 = Math.max(Math.abs(rotation.x), Math.abs(rotation.z));
+                        setRotation(rotation.withAxis(Direction.Axis.Y, horizontal2));
+                    }
+                    if ((out ? base.angleOptimizeAxisXZPullupOut.get() : base.angleOptimizeAxisXZPulluIn.get())
+                            && (horizontal
+                                    < (out
+                                            ? base.angleOptimizeAxisXZOutRange.get()
+                                            : base.angleOptimizeAxisXZInRange.get()))) {
+                        Vec3d rotation = movementDirection.rotation();
+                        double horizontal2 = Math.max(Math.abs(rotation.x), Math.abs(rotation.z));
+                        double sgnX = MathUtils.sgn(rotation.x);
+                        double sgnZ = MathUtils.sgn(rotation.z);
+                        setRotation(new Vec3d(sgnX * horizontal2, rotation.y, sgnZ * horizontal2));
+                    }
+                    setRotation(calculateBestPullupSpeed(movementDirection));
+                }
+            }
+            if (base.flyAntiSpearAfterAngle.get() && antiSpear) {
+                antiSpear(base.flyAntiSpearWhenPullup.get());
+            }
+            if (base.flyAntiSpearRevertFlyWhenPredictHit.get()
+                    && base.target instanceof PlayerEntity pl
+                    && SpearEnhance.isUsingSpear(pl)
+                    && predictMayHitAntiSpear(predictor)) {
+                Vec3d rotation = movementDirection.rotation();
+                setRotation(new Vec3d(-rotation.x, rotation.y, -rotation.z));
+            }
+            if (base.flyAntiSpearRotateFlyWhenPredictHit.get()
+                    && base.target instanceof PlayerEntity pl
+                    && SpearEnhance.isUsingSpear(pl)
+                    && predictMayHitAntiSpear(predictor)) {
+                Vec3d rotation = movementDirection.rotation();
+                setRotation(new Vec3d(rotation.z, rotation.y, -rotation.x));
+            }
+        }
+
+        protected void setTargetToPlayer(Vec3d targetPos) {
+            double lerpY = base.maceYLevelWeight.get();
+            // use real y, because player may want to hit the target
+            double baseY = base.getCurrentPos().y;
+
+            double yLerp = (targetPos.y * lerpY + baseY * (1.0D - lerpY));
+            if (base.flyAntiSpearUseSpearResetWhenFollow.get()) {
+                SpearEnhance.INSTANCE.setForceSpearReset(true);
+            }
+            if (base.currentOnGround) {
+                targetPos = targetPos.add(0, base.followOnGroundHeight.get().orElse(0.0D), 0);
+            }
+            movementDirection.speed(10);
+            Predicate<ElytraMotion> conditionMovement = (vec3) -> {
+                if (vec3.rotation().y >= 0) {
+                    return false;
+                }
+                float pitch = EntityUtils.rotationToPitch(vec3.rotation());
+                if (pitch < base.minPitchDownwards.get()) {
+                    Vec3d predictorMovement = simulateMovement(vec3);
+                    if (!TargetSelector.INSTANCE.isWithinAttackRange(
+                            mc.player.getPos().add(predictorMovement), base.target)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            direction_calculate:
+            {
+                if (base.maceFollowUsePredictorLine.get()) {
+                    double distance = mc.player.getPos().distanceTo(targetPos);
+                    if (distance > base.maceFollowStartPredictDistance.get()) {
+                        double predictionTicks = Math.min(
+                                (distance - base.maceFollowStartPredictDistance.get())
+                                        * base.maceFollowPredictTicksPerDistance.get(),
+                                base.maceFollowMaxPredictionTicks.get());
+                        Vec3d predictionPosition = PositionPredict.INSTANCE
+                                .attackPredictArgument
+                                .get()
+                                .predictWithExtraTicks(base.target, predictionTicks);
+                        Vec3d untrustedDirection = calculateTargetDirection(predictionPosition);
+                        if (untrustedDirection.y < 0
+                                && conditionMovement.test(movementDirection.withRotation(untrustedDirection))) {
+                            setRotation(untrustedDirection);
+                            break direction_calculate;
+                        } else {
+                            if (base.continuePullupIfCannotChaseTarget.get()) {
+                                break direction_calculate;
+                            }
+                        }
+                    }
+                }
+                boolean near = targetPos.squaredDistanceTo(mc.player.getPos())
+                        < MathUtils.s2(base.chooseDownTargetDistance.get());
+                if (!near) {
+                    setRotation(calculateTargetDirection(targetPos));
+                    if (conditionMovement.test(movementDirection)) {
+                        break direction_calculate;
+                    }
+                }
+                if (near || (movementDirection.rotation().y >= 0 && base.followDownPosWhenLow.get())) {
+                    setRotation(calculateTargetDirection(targetPos.withAxis(Direction.Axis.Y, baseY)));
+                    if (conditionMovement.test(movementDirection)) {
+                        break direction_calculate;
+                    } else {
+                        setRotation(calculateTargetDirection(
+                                targetPos.withAxis(Direction.Axis.Y, yLerp - base.maceFollowMinHeight.get())));
+                        if (conditionMovement.test(movementDirection)) {
+                            break direction_calculate;
+                        }
+                    }
+                }
+            }
+
+            boolean onGroundSupport = base.currentOnGround;
+            {
+                // use real value, because predictors may predict wrong values
+                if (yLerp - base.maceFollowMinHeight.get() > mc.player.getY()) {
+                    // to nothing modify
+                    if (movementDirection.rotation().y < 0) {
+                        setRotation(movementDirection.rotation().withAxis(Direction.Axis.Y, 0));
+                    }
+                    // 我没招了。这还是尽快重开吧
+                }
+            }
+            if (!conditionMovement.test(movementDirection)) {
+                setRotation(movementDirection.rotation().withAxis(Direction.Axis.Y, 0));
+            }
+            if (movementDirection.rotation().y >= 0 || movementDirection.speed() == 0.0D) {
+                return;
+            }
+            movementDirection.speed(10);
+            boolean antiSpear = willUseAntiSpear(base.flyAntiSpear.get(), base.flyAntiSpearRange.get(), targetPos);
+            // only optimize when target offground
+            if (!base.flyAntiSpearAfterAngle.get() && antiSpear) {
+                antiSpear(base.flyAntiSpear.get());
+            }
+            if (!onGroundSupport && base.angleOptimizeFollow.get()) {
+                if (movementDirection.rotation().y < -1E-6) {
+                    var distancePair = base.angleOptimizeFollowRange.get();
+                    double distance;
+                    if (SpearEnhance.isHoldingSpear(mc.player)) {
+                        distance = distancePair.y();
+                    } else if (antiSpear) {
+                        distance = distancePair.z();
+                    } else {
+                        distance = distancePair.x();
+                    }
+                    double horizontal = mc.player.getPos().subtract(targetPos).length();
+                    if (horizontal > distance) {
+                        double horizontal2 = Math.max(
+                                Math.abs(movementDirection.rotation().x), Math.abs(movementDirection.rotation().z));
+                        if (horizontal2 > 0.1) {
+                            // rescale
+                            Vec3d rotation = movementDirection.rotation();
+                            if (!base.angleOptimizeFollowPitchLimit.get().isPresent()
+                                    || EntityUtils.rotationToPitch(rotation)
+                                            < base.angleOptimizeFollowPitchLimit
+                                                    .get()
+                                                    .getValue()) {
+                                if (Math.abs(rotation.y) > horizontal2) {
+                                    setRotation(rotation.withAxis(Direction.Axis.Y, -horizontal2));
+                                }
+                                setRotation(calculateBestDownForwardSpeed(movementDirection, true, false));
+                            }
+                        }
+                    }
+                }
+            }
+            if (base.flyAntiSpearAfterAngle.get() && antiSpear) {
+                antiSpear(base.flyAntiSpear.get());
+            }
+            if (base.flyAntiSpearPullupWhenPredictHit.get()
+                    && base.target instanceof PlayerEntity pl
+                    && SpearEnhance.isUsingSpear(pl)
+                    && predictMayHitAntiSpear(targetPos)) {
+                setRotation(movementDirection.rotation().multiply(-1, -1, -1));
+            }
+        }
+
+        @Override
+        public synchronized void onUpdate() {
+            currentTargetUpFly = false;
+            super.onUpdate();
+        }
+
+        @Override
+        public synchronized void onAttack(Entity entity) {
+            if ((mc.player.isFallFlying() || mc.player.getAbilities().flying)
+                    && stateMachine.getState() != STATE_PULL_UP) {
+                // just in few ticks for the attack(current tick)
+                // pull up only when after mace attack to miss
+                if (movementDirection.rotation().y >= 0
+                        || (lastMaceAttackTick >= Tasks.getTick() - 1
+                                && currentTargetUpFly
+                                && TargetSelector.INSTANCE.isWithinAttackRange(
+                                        mc.player.getPos(), entity.getBoundingBox()))) {
+                    stateMachine.setState(STATE_PULL_UP);
+                    stateMachine.step();
+                } else {
+                    stateMachine.setState(STATE_FOLLOW);
+                }
+            }
+        }
+    }
+
+    public static class MaceAuraGround extends AbstractMaceBehaviour implements HitListener {
+        private void setTargetToEat(Vec3d predictor, boolean headSimulation, double height) {
+            if (headSimulation) {
+                Vec3d vec3d = base.getCurrentPos().subtract(mc.player.getPos());
+                if (vec3d.horizontalLength() > base.combatRange()) {
+                    setTargetToPlayerUpper(predictor, height);
+                } else {
+                    setMovement(new Vec3d(-vec3d.x, 0, -vec3d.z).normalize(), 10);
+                }
+
+            } else {
+                setTargetToPlayerUpper(predictor, height);
+            }
+        }
+
+        @Override
+        public int onStatePullUp(StateMachine machine) {
+            boolean shouldForcePullUp = shouldPullUpEating();
+            boolean shouldFollow;
+            Vec3d testMovement = new Vec3d(0, 0.5, 0);
+            Vec3d simulation = MovTasks.simulateMovement(mc.player, mc.player.getPos(), testMovement, false);
+            Vec3d predictor = base.maceUsePredictor.get()
+                    ? PositionPredict.INSTANCE.attackPredictArgument.get().predict(base.target)
+                    : base.getCurrentPos();
+            boolean simulationHead = simulation.squaredDistanceTo(testMovement) > 1E-4;
+            double pullupHeight = base.maceHeightGround.get();
+            if (base.maceChaseFollowYBias.get()) {
+                double horizontalRange = mc.player.getPos().subtract(predictor).horizontalLength();
+                if (base.maceChaseFollowBiasStartHorizontalRange.get() < horizontalRange) {
+                    pullupHeight += base.maceChaseFollowBiasExtraHeightPerBlock.get()
+                            * (horizontalRange - base.maceChaseFollowBiasStartHorizontalRange.get());
+                }
+            }
+            double targetY = base.getCurrentPos().y + pullupHeight;
+            // check pulling time
+
+            boolean mayFollow = (mc.player.getY() >= targetY && startPullUpTick > 1)
+                    || (mc.player.getY() > base.getCurrentPos().y
+                            && startPullUpTick != 0
+                            && Tasks.getTick() > base.maceRemainPullUpTick.get() + startPullUpTick + pullupHeight);
+            shouldFollow = simulationHead || mayFollow;
+            if (shouldFollow) {
+                if (!shouldForcePullUp) {
+                    return STATE_FOLLOW;
+                } else {
+                    setTargetToEat(base.getCurrentPos(), simulationHead, pullupHeight);
+                    machine.markForEndState();
+                    return STATE_PULL_UP;
+                }
+            } else {
+
+                setTargetToPlayerUpper(predictor, pullupHeight);
+                machine.markForEndState();
+                return STATE_PULL_UP;
+            }
+        }
+
+        @Override
+        public int onStateFollow(StateMachine machine) {
+            tryPreSwapArmorForAttack();
+            if (PlayerStateManager.INSTANCE.fallDistance < 1E-6 && lastFallDistance > 1E-6) {
+                // we trigger falldistance reset during chase
+                return STATE_PULL_UP;
+            }
+            if (shouldPullUpEating()) {
+                return STATE_PULL_UP;
+            }
+            Vec3d targetPos = base.maceUsePredictor.get()
+                    ? PositionPredict.INSTANCE.attackPredictArgument.get().predict(base.target)
+                    : base.getCurrentPos();
+            // use real bounding box for hit
+            boolean targetInRange = TargetSelector.INSTANCE.isWithinAttackRange(
+                    mc.player.getPos(),
+                    base.target,
+                    CombatTasks.getCombatExtra().getAttackAtTargetRange(base.target));
+
+            if (base.currentOnGround) {
+                if (targetInRange) {
+                    setTargetToPlayer(base.getCurrentPos());
+                    scheduleAttack();
+                    if (movementDirection.rotation().y >= 0) {
+                        return STATE_PULL_UP;
+                    }
+                    machine.markForEndState();
+                    return STATE_FOLLOW;
+                } else {
+                    setTargetToPlayer(base.getCurrentPos());
+                    Vec3d testMovement = movementDirection.rotation().multiply(0.1);
+                    Vec3d simulation = MovTasks.simulateMovement(mc.player, mc.player.getPos(), testMovement, true);
+                    boolean simulationFeet = simulation.squaredDistanceTo(testMovement) > 1E-4;
+                    if (simulationFeet || movementDirection.rotation().y >= 0) {
+                        // reset movement
+                        setSpeed(0);
+                        return STATE_PULL_UP;
+                    } else {
+                        machine.markForEndState();
+                        return STATE_FOLLOW;
+                    }
+                }
+            } else {
+                Vec3d testVelocity = new Vec3d(0, 1, 0);
+                Vec3d simulation = MovTasks.simulateMovement(base.target, targetPos, testVelocity, false);
+                boolean targetHeadSimulation = simulation.squaredDistanceTo(testVelocity) > 1E-4;
+                if (targetHeadSimulation) {
+                    Vec3d target = targetPos.add(0, -1.62 - 2.8 + simulation.length(), 0);
+                    Vec3d movement = target.subtract(mc.player.getPos());
+                    setMovement(movement, 10);
+                    if (movement.y > -1 && targetInRange) {
+                        scheduleAttack();
+                        machine.markForEndState();
+                        return movementDirection.rotation().y > 0 ? STATE_PULL_UP : STATE_FOLLOW;
+                    } else if (movementDirection.rotation().y >= 0) {
+                        return STATE_PULL_UP;
+                    } else {
+                        machine.markForEndState();
+                        return STATE_FOLLOW;
+                    }
+                } else {
+                    if (targetInRange) {
+                        scheduleAttack();
+                    }
+                    setTargetToPlayer(targetPos);
+                    if (movementDirection.rotation().y >= 0) {
+                        setSpeed(0);
+                        return STATE_PULL_UP;
+                    } else {
+                        machine.markForEndState();
+                        return STATE_FOLLOW;
+                    }
+                }
+            }
+        }
+
+        @Override
+        protected void setTargetToPlayerUpper(Vec3d predictor, double height) {
+            if (base.macePullupUseV5.get()
+                    && mc.player.getPos().subtract(predictor).horizontalLength()
+                            <= base.macePullupUseV5Distance.get()) {
+                movementDirection.algorithm(ElytraExtra.Al.V5_PULLUP_ONLY);
+            }
+            setSpeed(10);
+            if (base.currentOnGround) {
+                if (predictor.y > mc.player.getY()) {
+                    setRotation(predictor
+                            .withAxis(Direction.Axis.Y, (predictor.getY() + height))
+                            .subtract(mc.player.getPos()));
+                } else {
+                    Vec3d delta = mc.player.getPos().subtract(predictor);
+                    double horizontal = delta.horizontalLength();
+                    if (horizontal < height && delta.y > horizontal) {
+                        setRotation(delta);
+                    } else {
+                        Vec3d targetPos = delta.withAxis(Direction.Axis.Y, 0)
+                                .normalize()
+                                .multiply(height)
+                                .withAxis(Direction.Axis.Y, height);
+                        setRotation(targetPos.subtract(delta));
+                    }
+                }
+            } else {
+                Vec3d testVelocity = new Vec3d(0, 1, 0);
+                Vec3d simulation = MovTasks.simulateMovement(base.target, predictor, testVelocity, false);
+                boolean targetHeadSimulation = simulation.squaredDistanceTo(testVelocity) > 1E-4;
+                // no space above target
+                if (targetHeadSimulation) {
+                    setRotation(predictor.add(testVelocity).subtract(mc.player.getPos()));
+                } else {
+                    Vec3d movement = null;
+                    boolean yLow = predictor.getY() >= mc.player.getY();
+                    if (base.combatSmoothFlightPullup.get()) {
+                        double combatRange = base.combatMaceRange.get();
+                        if (base.combatSmoothCircleDynamicRangeByHeight.get().isPresent()) {
+                            Vec3 arguments = base.combatSmoothCircleDynamicRangeByHeight
+                                    .get()
+                                    .getValue();
+                            double predictorYL = predictor.y - mc.player.getY();
+                            if (predictorYL > arguments.x()) {
+                                combatRange += Math.min(predictorYL - arguments.x(), arguments.z()) * arguments.y();
+                            }
+                        }
+                        combatRange = combatRange / 2;
+                        if (yLow) {
+                            Vec3d center =
+                                    base.target.dimensions.getBoxAt(predictor).getCenter();
+                            double radius = combatRange + base.combatSmoothCircleExtraRange.get();
+                            Pair<Vec3d, Vec3d> tangents =
+                                    MathUtils.getTangentWithSameXZ(center, radius, mc.player.getEyePos());
+                            Vec3d vec3d = tangents.getFirst();
+                            Vec3d vec3d2 = tangents.getSecond();
+                            Vec3d vec3d3 = vec3d.y < vec3d2.y ? vec3d2 : vec3d;
+                            // go upper not horizontal
+                            vec3d3 = vec3d3.add(0, 1E-2, 0);
+                            if (Math.abs(base.combatSmoothOutPullRatio.get()) > 1E-6
+                                    && ((base.combatSmoothOutPullRatioUseHorizontalDistance.get()
+                                                    ? center.subtract(mc.player.getEyePos())
+                                                            .horizontalLengthSquared()
+                                                    : center.squaredDistanceTo(mc.player.getEyePos()))
+                                            < MathUtils.s2(base.combatSmoothOutPullRatioEnableDistance.get()))) {
+                                // 垂线
+                                vec3d3 = vec3d3.normalize();
+                                Vec3d delta = mc.player.getEyePos().subtract(center);
+                                Vec3d horizontalMul = new Vec3d(delta.x, 0, delta.z)
+                                        .normalize()
+                                        .multiply(base.combatSmoothOutPullRatio.get());
+                                vec3d3 = vec3d3.add(horizontalMul).normalize();
+                            }
+                            if (vec3d3.y > 0) {
+                                movement = vec3d3.normalize().multiply(10);
+                            }
+                        }
+                    }
+                    if (movement == null) {
+                        movement = predictor
+                                .withAxis(Direction.Axis.Y, (predictor.getY() + (height)))
+                                .subtract(mc.player.getPos());
+                        if (movement.length() < 5) {
+                            movement = movement.normalize().multiply(5);
+                        }
+                    }
+                    setRotation(movement);
+                }
+            }
+            setSpeed(10);
+        }
+
+        @Override
+        protected void setTargetToPlayer(Vec3d targetPos) {
+            Vec3d playerPos = mc.player.getPos();
+            Vec3d fallbackTargetPos;
+            if (base.currentOnGround) {
+                fallbackTargetPos =
+                        targetPos.add(0, base.followOnGroundHeight.get().orElse(0.5), 0);
+                // in case of landing
+                // ElytraExtra.INSTANCE.autoTakeoff();
+            } else {
+                fallbackTargetPos = targetPos;
+                if (base.flyAntiSpearUseSpearResetWhenFollow.get()) {
+                    SpearEnhance.INSTANCE.setForceSpearReset(true);
+                }
+            }
+
+            boolean found = false;
+            if (base.currentOnGround) {
+                double attackAtTargetRange = CombatTasks.getCombatExtra().getAttackAtTargetRange(base.target);
+                Vec3d targetEyePos = base.getCurrentPos().add(0, base.target.dimensions.eyeHeight(), 0);
+                BlockHitResult raycastResult = mc.world.raycast(new RaycastContext(
+                        mc.player.getEyePos(),
+                        targetEyePos,
+                        net.minecraft.world.RaycastContext.ShapeType.COLLIDER,
+                        net.minecraft.world.RaycastContext.FluidHandling.NONE,
+                        mc.player));
+                if (raycastResult != null
+                        && raycastResult.getType() != HitResult.Type.MISS
+                        && raycastResult.getPos().squaredDistanceTo(targetEyePos)
+                                <= MathUtils.s2(2.0D * attackAtTargetRange)) {
+                    BlockPos raycastPos = net.minecraft.util.math.BlockPos.ofFloored(raycastResult.getPos());
+                    int searchRadius = Math.max(1, (int) Math.ceil(attackAtTargetRange));
+                    List<BlockPos> searchPoses = new ArrayList<>();
+                    for (int x = raycastPos.getX() - searchRadius; x <= raycastPos.getX() + searchRadius; x++) {
+                        for (int y = raycastPos.getY() - searchRadius; y <= raycastPos.getY() + searchRadius; y++) {
+                            for (int z = raycastPos.getZ() - searchRadius; z <= raycastPos.getZ() + searchRadius; z++) {
+                                searchPoses.add(new BlockPos(x, y, z));
+                            }
+                        }
+                    }
+                    searchPoses.sort(
+                            Comparator.comparingDouble(pos -> pos.toCenterPos().squaredDistanceTo(targetEyePos)));
+                    for (BlockPos pos : searchPoses) {
+                        Vec3d centerPos = pos.toCenterPos();
+                        if (!TargetSelector.INSTANCE.isWithinAttackRange(
+                                centerPos, base.target, attackAtTargetRange + 0.5D)) {
+                            continue;
+                        }
+                        if (mc.world
+                                        .raycast(new RaycastContext(
+                                                playerPos,
+                                                centerPos,
+                                                RaycastContext.ShapeType.COLLIDER,
+                                                RaycastContext.FluidHandling.NONE,
+                                                mc.player))
+                                        .getType()
+                                != HitResult.Type.MISS) {
+                            continue;
+                        }
+                        Box box = mc.player.dimensions.getBoxAt(centerPos);
+                        if (!mc.world.isSpaceEmpty(box)) {
+                            continue;
+                        }
+                        setRotation(centerPos.subtract(playerPos));
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                setRotation(calculateTargetDirection(fallbackTargetPos)); // fallbackTargetPos.subtract(playerPos);
+            }
+            setSpeed(10);
+        }
+
+        @Override
+        public void onAttack(Entity entity) {
+            if ((mc.player.isFallFlying() || mc.player.getAbilities().flying)
+                    && stateMachine.getState() != STATE_FOLLOW) {
+                // just in few ticks for the attack(current tick)
+                // pull up only when after mace attack to miss
+                stateMachine.setState(STATE_FOLLOW);
+            }
+        }
+    }
+
+    public static class SpearAura extends AbstractBotBehaviour implements HitListener {
+        static final int STATE_NONE = 0;
+        static final int STATE_FOLLOW = 1;
+        static final int STATE_NEAR_FOLLOW = 2;
+        static final int STATE_PULL_OVER = 3;
+        int nearFollowTimer;
+        int pullOverTimer;
+        StateMachine stateMachine;
+
+        //        @Override
+        //        public Entity searchTarget() {
+        //            return CombatTasks.getTargetSelector()
+        //                    .searchAttackEntity(base.targetRange.get(), true, TargetSelector::canPlayerDirectlySee);
+        //        }
+
+        public SpearAura() {
+            this.stateMachine = new StateMachine(
+                    STATE_NONE,
+                    this::onStateUpdate,
+                    this::onStateNone,
+                    this::onStateFollow,
+                    this::onStateNearFollow,
+                    this::onStatePullOver);
+            resetSpeedOnStateChange(stateMachine, STATE_NONE, STATE_FOLLOW, STATE_NEAR_FOLLOW, STATE_PULL_OVER);
+            this.stateMachine.registerListener(STATE_NEAR_FOLLOW, this::onSwitchToNearFollow);
+            this.stateMachine.registerListener(STATE_PULL_OVER, this::onSwitchToPullOver);
+        }
+
+        public int onStateUpdate(StateMachine machine, int state) {
+            if (base.target == null) {
+                return STATE_NONE;
+            }
+            return state;
+        }
+
+        public int onStateNone(StateMachine machine) {
+            if (base.target != null) {
+                if (!VItem.getInstance().isSpear(mc.player.getMainHandStack())
+                        && !VItem.getInstance().isSpear(mc.player.getOffHandStack())) {
+                    base.logI18N("message.module.elytra-bot.no-spear");
+                }
+                return STATE_FOLLOW;
+            }
+            machine.markForEndState();
+            setSpeed(0);
+            return STATE_NONE;
+        }
+
+        private Vec3d getTargetPosition() {
+            Vec3d predictedPosition = base.spearUsePredictor.get()
+                    ? PositionPredict.INSTANCE
+                            .getPredictor(base.target)
+                            .predict(2, PredictionMode.PREDICTOR_NV.ordinal(), 10)
+                    : base.getCurrentSyncedPos();
+            if (base.currentOnGround) {
+                return predictedPosition.add(0, base.target.dimensions.eyeHeight(), 0);
+            }
+
+            return predictedPosition.add(0, base.target.dimensions.height() * 2 / 3, 0);
+        }
+
+        public int onStateFollow(StateMachine machine) {
+            Vec3d targetPos = getTargetPosition();
+            if (base.spearAntiSpearPullOverWhenPredictHit.get() && predictMayHitAntiSpear(targetPos)) {
+                return STATE_PULL_OVER;
+            }
+            if (mc.player.getEyePos().squaredDistanceTo(targetPos) < MathUtils.s2(getActiveRange())) {
+                return STATE_NEAR_FOLLOW;
+            }
+            machine.markForEndState();
+            /// compute their
+            setTargetToPlayer(targetPos, false);
+            return STATE_FOLLOW;
+        }
+
+        public int onStateNearFollow(StateMachine machine) {
+            Vec3d targetPosition = getTargetPosition();
+            if (base.spearAntiSpearPullOverWhenPredictHit.get() && predictMayHitAntiSpear(targetPosition)) {
+                return STATE_PULL_OVER;
+            }
+            if ((base.currentInCombatRange && base.currentAction == TargetAction.CIRCLING)
+                    || base.currentAction == TargetAction.TOWARDS
+                    || base.currentAction == TargetAction.AFK) {
+                if (!SpearEnhance.canSpearKineticAttack()) {
+                    return STATE_PULL_OVER;
+                }
+            }
+            double sqDist = mc.player.getEyePos().squaredDistanceTo(targetPosition);
+            if (sqDist > MathUtils.s2(getActiveRange())) {
+                return STATE_FOLLOW;
+            } else {
+                //                else if (++nearFollowTimer > getMaxAttackPeriod()) {
+                if (!base.spearEnableNearPassthroughFeature.get() && sqDist < MathUtils.s2(getMinRange())) {
+                    return STATE_PULL_OVER;
+                }
+                machine.markForEndState();
+                setTargetToPlayer(targetPosition, base.spearEnableNearPassthroughFeature.get());
+                return STATE_NEAR_FOLLOW;
+            }
+        }
+
+        // todo: howto when combating
+        public int onStatePullOver(StateMachine machine) {
+            Vec3d targetPosition;
+            boolean predictMayHit;
+            if (++pullOverTimer > getCooldown()) {
+                return STATE_FOLLOW;
+            } else {
+                targetPosition = getTargetPosition();
+                predictMayHit = predictMayHitAntiSpear((targetPosition));
+                // calculate left time
+                if (!predictMayHit && base.currentAction != null) {
+                    if (base.currentAction == TargetAction.AFK
+                            || base.currentAction == TargetAction.SLOW_SPEED
+                            || (base.currentInCombatRange)
+                            || base.currentAction == TargetAction.ESCAPING) {
+                        // stable
+                        double canChaseDistance = getMinRange();
+                        if (mc.player.getEyePos().squaredDistanceTo(targetPosition) > MathUtils.s2(canChaseDistance)) {
+                            Vec3d currentPos = base.getCurrentPos();
+                            Vec3d predictMovement = targetPosition.subtract(currentPos);
+                            if (predictMovement.y < -predictMovement.horizontalLength()) {
+                                return STATE_FOLLOW;
+                            } else if (predictMovement.y < predictMovement.horizontalLength()
+                                    && base.spearEscapingPulloutChaseHorizontal.get()) {
+                                return STATE_FOLLOW;
+                            } else if (predictMovement.y > predictMovement.horizontalLength()
+                                    && base.spearEscapingPulloutChaseHorizontal.get()) {
+                                return STATE_FOLLOW;
+                            }
+                        }
+                    } else {
+                        // meeting
+                        // escape their attack range, can hit
+                        double canChaseDistance = getActiveRange();
+                        if (mc.player.getEyePos().squaredDistanceTo(targetPosition) > MathUtils.s2(canChaseDistance)) {
+                            return STATE_FOLLOW;
+                        }
+                    }
+                }
+            }
+            machine.markForEndState();
+            Vec3d look = targetPosition.subtract(mc.player.getEyePos());
+            if (base.currentOnGround) {
+                if (look.lengthSquared() < getMinRange()) {
+                    setRotation(look.negate().add(0, 1, 0));
+                } else {
+                    setRotation(look.negate());
+                }
+            } else {
+                setRotation(look.negate());
+            }
+            setSpeed(10);
+            if (predictMayHit && base.spearAntiSpearPullOverWhenPredictHit.get()) {
+                Vec3d rotation = movementDirection.rotation();
+                setRotation(
+                        Tasks.getTick() % 2 == 0
+                                ? new Vec3d(rotation.z, rotation.y, -rotation.x)
+                                : new Vec3d(-rotation.z, rotation.y, rotation.x));
+            }
+            Vec3d rotation = movementDirection.rotation();
+            if (rotation.y < 0) {
+                setRotation(rotation.withAxis(Direction.Axis.Y, Math.abs(rotation.y)));
+            } else if (rotation.y == 0) {
+                setRotation(rotation.withAxis(Direction.Axis.Y, 1));
+            }
+            rotation = movementDirection.rotation();
+            Vec3d test = rotation.normalize().multiply(0.5D);
+            Vec3d simulate = MovTasks.simulateMovement(mc.player, mc.player.getPos(), test, true);
+            Vec3d delta = simulate.subtract(test);
+            if (delta.horizontalLengthSquared() > 1E-2) {
+                machine.markForEndState();
+                return STATE_FOLLOW;
+            }
+            if (delta.y != 0) {
+                setRotation(rotation.withAxis(Direction.Axis.Y, 0));
+            } else {
+                angleOptimize();
+            }
+            return STATE_PULL_OVER;
+        }
+
+        public void setTargetToPlayer(Vec3d targetPosition, boolean through) {
+            Vec3d look;
+            look = calculateTargetDirection(targetPosition);
+            setSpeed(10.0);
+            if (through) {
+                Vec3d lookHorizontal = look.withAxis(Direction.Axis.Y, 0);
+                Vec3d lastMoveHorizontal =
+                        PlayerStateManager.INSTANCE.lastKnownRealMovementSpeed.withAxis(Direction.Axis.Y, 0);
+                double dotValue = lookHorizontal.dotProduct(lastMoveHorizontal);
+                if (dotValue < 0) {
+                    look = look.negate();
+                }
+            }
+            setRotation(look);
+            if (targetPosition.subtract(mc.player.getEyePos()).length() > base.spearChaseOptimizeAngle.get()) {
+                angleOptimize();
+            }
+        }
+
+        public void angleOptimize() {
+            if (base.spearHideAngleOptimize.get()) {
+                Vec3d rotation = movementDirection.rotation();
+                if (rotation.y >= 0) {
+                    setRotation(rotation.withAxis(Direction.Axis.Y, 1));
+                    setRotation(calculateBestPullupSpeed(movementDirection));
+                } else {
+                    setRotation(calculateBestDownForwardSpeed(movementDirection, true, true));
+                }
+            }
+        }
+
+        public void onSwitchToNearFollow(boolean isOn) {
+            nearFollowTimer = 0;
+        }
+
+        public void onSwitchToPullOver(boolean isOn) {
+            pullOverTimer = 0;
+        }
+
+        public double getActiveRange() {
+
+            return base.spearActiveRange.get();
+        }
+
+        public double getMinRange() {
+            return base.spearMinRange.get();
+        }
+
+        public int getCooldown() {
+            return base.spearPullawayCooldown.get();
+        }
+
+        @Override
+        public synchronized void onUpdate() {
+            super.onUpdate();
+            if (mc.player.isFallFlying() || mc.player.getAbilities().flying) {
+                stateMachine.step();
+            } else {
+                setSpeed(0.0D);
+                stateMachine.setState(STATE_NONE);
+            }
+        }
+
+        @Override
+        public void onEnable() {
+            stateMachine.setState(STATE_NONE);
+            pullOverTimer = 0;
+            nearFollowTimer = 0;
+        }
+
+        @Override
+        public void onDisable() {}
+
+        @Override
+        public synchronized void onHit(int spear) {
+            if (spear == HIT_SPEAR) {
+
+                nearFollowTimer = 0;
+                stateMachine.setState(STATE_PULL_OVER);
+                pullOverTimer = 0;
+            }
+        }
+    }
+
+    public static class WeaponArua extends AbstractBotBehaviour {
+
+        @Override
+        public void onUpdate() {}
+
+        @Override
+        public void onEnable() {}
+
+        @Override
+        public void onDisable() {}
+    }
+
+    public static class LandingControl extends AbstractBotBehaviour {
+
+        @Override
+        public void onUpdate() {}
+
+        @Override
+        public void onEnable() {}
+
+        @Override
+        public void onDisable() {}
+    }
+
+    public enum TargetAction {
+        ESCAPING,
+        TOWARDS,
+        CIRCLING,
+        SLOW_SPEED,
+        AFK;
+    }
+
+    public enum Mode implements ConfigEnum {
+        FOLLOW,
+        MACE_ARUA,
+        SPEAR_ARUA;
+
+        @Override
+        public String getConfigEnumType() {
+            return "elytra_bot_mode";
+        }
+    }
+}

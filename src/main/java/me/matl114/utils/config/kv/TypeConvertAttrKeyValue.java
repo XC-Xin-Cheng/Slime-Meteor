@@ -1,0 +1,173 @@
+package me.matl114.utils.config.kv;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import me.matl114.managers.config.NBTType;
+import me.matl114.utils.config.AttrKeyValue;
+import me.matl114.utils.config.WrapperFactory;
+
+public class TypeConvertAttrKeyValue<W, T> implements AttrKeyValue<T>, Cloneable {
+    public AttrKeyValue<W> delegate;
+
+    public final WrapperFactory<T, W> wrapperFactory;
+    public final CustomWidgetGenerator<T> factoryOverride;
+    public final WrapperFactory<String, T> stringifyOverride;
+
+    public TypeConvertAttrKeyValue(AttrKeyValue<W> attrKeyValue, WrapperFactory<T, W> wrapperFactory, NBTType<T> type) {
+        this(attrKeyValue, wrapperFactory, type.customWidgetFactory(), type.stringifyFactory());
+    }
+
+    public TypeConvertAttrKeyValue(
+            AttrKeyValue<W> attrKeyValue,
+            WrapperFactory<T, W> wrapperFactory,
+            CustomWidgetGenerator<T> factoryOverride,
+            WrapperFactory<String, T> stringifyFactory) {
+        this.wrapperFactory = wrapperFactory;
+        this.factoryOverride = factoryOverride;
+        this.stringifyOverride = stringifyFactory;
+        this.delegate = attrKeyValue;
+        checkUpdate();
+    }
+
+    protected boolean validate = true;
+
+    private List<Predicate<T>> validators = new ArrayList<>();
+
+    private String value = "";
+
+    private W lastUpdate;
+
+    private void checkUpdate() {
+        var re = delegate.get();
+        if (!Objects.equals(re, lastUpdate)) {
+            lastUpdate = re;
+            value = stringifyOverride.get(wrapperFactory.get(re));
+            validate = true;
+        }
+    }
+
+    @Override
+    public String getKeyName() {
+        return this.delegate.getKeyName();
+    }
+
+    @Override
+    public WrapperFactory<String, T> getStringifyFactory() {
+        return stringifyOverride;
+    }
+
+    @Override
+    public String getInput() {
+        checkUpdate();
+        return value;
+    }
+
+    @Override
+    public T get() {
+        checkUpdate();
+        return wrapperFactory.get(lastUpdate);
+    }
+
+    @Override
+    public boolean isValueValid(T val) {
+        W value;
+        try {
+            value = create0(val);
+        } catch (Throwable e) {
+            return false;
+        }
+        return delegate.isValueValid(value);
+    }
+
+    @Override
+    public boolean setOriginValue(T val) {
+        String value0 = stringifyOverride.get(val);
+        setInput(value0);
+        return isValidate();
+    }
+
+    @Override
+    public boolean validateAndUpdate() {
+        try {
+            T val = stringifyOverride.create(value);
+            W wval = create0(val);
+            if (delegate.setOriginValue(wval)) {
+                validate = true;
+                lastUpdate = wval;
+                return true;
+            }
+            validate = false;
+            return false;
+        } catch (Throwable e) {
+            return (validate = false);
+        }
+    }
+
+    @Override
+    public String toInput(T val) {
+        return stringifyOverride.get(val);
+    }
+
+    @Override
+    public boolean isValidate() {
+        return validate && delegate.isValidate();
+    }
+
+    @Override
+    public void addListener(Consumer<T> li) {
+        delegate.addListener(s -> li.accept(wrapperFactory.get(s)));
+    }
+
+    @Override
+    public void addValidator(Predicate<T> validator) {
+        validators.add(validator);
+    }
+
+    @Override
+    public List<Predicate<T>> getValidators() {
+        return validators;
+    }
+
+    private W create0(T val) {
+        if (validators.stream().anyMatch(s -> !s.test(val))) {
+            throw WrapperFactory.PARSE_FAILURE;
+        }
+        return wrapperFactory.create(val);
+    }
+
+    @Override
+    public CustomWidgetGenerator<T> getCustomWidgetFactory() {
+        return factoryOverride;
+    }
+
+    @Override
+    public <S extends AttrKeyValue<T>> S copy() {
+        TypeConvertAttrKeyValue<W, T> val = clone();
+        val.delegate = val.delegate.copy();
+        return (S) val;
+    }
+
+    @Override
+    public void setInput(String string) {
+        checkUpdate();
+        if (Objects.equals(this.value, string)) {
+            return;
+        }
+        this.value = string;
+        this.validate = validateAndUpdate();
+    }
+
+    @Override
+    public TypeConvertAttrKeyValue<W, T> clone() {
+        try {
+            TypeConvertAttrKeyValue clone = (TypeConvertAttrKeyValue) super.clone();
+            clone.validators = new ArrayList<>(validators);
+            return clone;
+        } catch (CloneNotSupportedException e) {
+            throw new AssertionError();
+        }
+    }
+}

@@ -1,0 +1,190 @@
+package me.matl114.hacks.modules.mine;
+
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import lombok.Getter;
+import me.matl114.events.Event;
+import me.matl114.events.Listener;
+import me.matl114.hacks.api.BaseModule;
+import me.matl114.hacks.modules.interact.InteractExtra;
+import me.matl114.hacks.modules.move.PlayerStateManager;
+import me.matl114.managers.Tasks;
+import me.matl114.utils.ItemStackUtils;
+import me.matl114.utils.WorldUtils;
+import me.matl114.utils.inventory.ItemStackSample;
+import net.minecraft.block.BlockState;
+import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityType;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.packet.s2c.play.BlockBreakingProgressS2CPacket;
+import net.minecraft.util.Hand;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+
+public class MiningProgressManager extends BaseModule {
+    public static MiningProgressManager INSTANCE;
+
+    public MiningProgressManager() {
+        super("MiningProgressManager");
+        INSTANCE = this;
+    }
+
+    @Override
+    public void registerAll() {
+        super.registerAll();
+        registerListener(Listener.getEntityRemoveListener().getChannel(EntityType.PLAYER), this::onEntityRemove);
+        registerListener(Listener.getPlayerRespawnPoint(), this::onWorldChange);
+        registerListener(
+                Listener.getPacketPostHandlePoint().getChannel(BlockBreakingProgressS2CPacket.class),
+                this::onBlockProgressUpdate);
+        registerListener(Listener.getPreGameTick(), this::onUpdate);
+    }
+
+    final Map<Integer, BlockBreakTracker> trackedMap = new HashMap<>();
+
+    public Map<Integer, BlockBreakTracker> getBreakingMap() {
+        return trackedMap;
+    }
+
+    public void onEntityRemove(Event<Entity> event) {
+        trackedMap.remove(event.context.getId());
+    }
+
+    public void onWorldChange() {
+        trackedMap.clear();
+    }
+
+    public void onBlockProgressUpdate(Event<BlockBreakingProgressS2CPacket> eventProgress) {
+        int eid = eventProgress.context.getEntityId();
+        BlockPos ps = eventProgress.context.getPos();
+        if (mc.world.getEntityById(eid) instanceof PlayerEntity pl) {
+            int progress = eventProgress.context.getProgress();
+            if (progress == 255) {
+                // 傻逼吧。
+                progress = -1;
+            }
+            BlockBreakTracker tracker = trackedMap.computeIfAbsent(eid, (v) -> new BlockBreakTracker(pl));
+            tracker.pushBreakingProgress(ps, progress);
+        }
+    }
+
+    public void onUpdate() {
+        if (checkNull()) return;
+        for (var re : trackedMap.values()) {
+            re.tickWorld(mc.world);
+        }
+    }
+
+    @Getter
+    public static class BlockBreakTracker {
+        public BlockBreakTracker(PlayerEntity player) {
+            this.player = player;
+        }
+
+        public PlayerEntity player;
+        public BlockPos blockPos;
+        public int breakingStartTick = 0;
+        public int breakingProgress = -1;
+        public BlockPos potentialDoubleBreak;
+        public int doubleBreakProgress = -1;
+        public int potentialDoubleBreakStartTick = 0;
+
+        public void pushBreakingProgress(BlockPos pos, int breakingProgress) {
+            if (Objects.equals(blockPos, pos)) {
+                this.breakingProgress = breakingProgress;
+                updateB(pos);
+            } else if (Objects.equals(potentialDoubleBreak, pos)) {
+                this.doubleBreakProgress = breakingProgress;
+                updateD(pos);
+            } else {
+                if (blockPos == null) {
+                    this.breakingProgress = breakingProgress;
+                    updateB(pos);
+                } else {
+                    if (this.breakingProgress != 0 && this.doubleBreakProgress <= 0) {
+                        this.doubleBreakProgress = this.breakingProgress;
+                        updateD(this.blockPos);
+                    }
+                    this.breakingProgress = breakingProgress;
+                    updateB(pos);
+                }
+            }
+        }
+
+        private void updateB(BlockPos pos) {
+            if (!Objects.equals(blockPos, pos)) {
+                blockPos = pos;
+                breakingStartTick = Tasks.getTick();
+            }
+            if (breakingProgress >= 10) {
+                breakingProgress = -1;
+            }
+        }
+
+        private void updateD(BlockPos pos) {
+            if (!Objects.equals(potentialDoubleBreak, pos)) {
+                potentialDoubleBreak = pos;
+                potentialDoubleBreakStartTick = Tasks.getTick();
+            }
+            if (doubleBreakProgress >= 10) {
+                potentialDoubleBreak = null;
+                doubleBreakProgress = -1;
+            }
+        }
+
+        public void tickWorld(World world) {
+            if (potentialDoubleBreak != null
+                    && world.getBlockState(potentialDoubleBreak).isAir()) {
+                potentialDoubleBreak = null;
+                doubleBreakProgress = -1;
+            }
+        }
+
+        public boolean canMine() {
+            return canMine(1.0);
+        }
+
+        public boolean canMine(double extra) {
+            return InteractExtra.INSTANCE.isWithinInteractRange(
+                    this.player.getPos(), this.blockPos, InteractExtra.INSTANCE.getBlockReachDistance() + extra);
+        }
+
+        public float predictBreakingProgress() {
+            return predictGhostHandBreakSpeed(this.player, this.blockPos) * (Tasks.getTick() - breakingStartTick + 1);
+        }
+
+        public float predictDoubleBreakProgress() {
+            return predictGhostHandBreakSpeed(this.player, this.potentialDoubleBreak)
+                    * (Tasks.getTick() - potentialDoubleBreakStartTick + 1);
+        }
+
+        private static float predictGhostHandBreakSpeed(PlayerEntity player, BlockPos pos) {
+            PlayerStateManager.PlayerStatus status = PlayerStateManager.INSTANCE.getPlayerStatus(player);
+            BlockState blockState = mc.world.getBlockState(pos);
+            ItemStack bestTool = status == null
+                    ? player.getStackInHand(Hand.MAIN_HAND)
+                    : status.trackedInventoryItems.stream()
+                            .max(Comparator.comparingDouble(s -> {
+                                return WorldUtils.getPlayerBlockBreakingSpeedWithCanMineMultiply(
+                                        player, blockState, s.sample());
+                            }))
+                            .map(ItemStackSample::sample)
+                            .orElse(player.getStackInHand(Hand.MAIN_HAND));
+            ItemStack stackCopy = bestTool.copy();
+            if (!stackCopy.isEmpty()) {
+                int level = ItemStackUtils.getEnchantmentLevel(
+                        ItemStackUtils.getItemEnchant(stackCopy), Enchantments.EFFICIENCY);
+                if (level < 5) {
+                    ItemStackUtils.setEnchantmentLevel(stackCopy, Enchantments.EFFICIENCY, 5);
+                }
+            }
+
+            float speed = WorldUtils.getPlayerBlockBreakingSpeedWithCanMineMultiply(player, blockState, stackCopy);
+            return WorldUtils.calcBlockBreakingDelta(blockState, mc.world, pos, speed);
+        }
+    }
+}

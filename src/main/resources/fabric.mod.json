@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "slimefunhelper",
+  "version": "${version}",
+  "name": "slime_meteor",
+  "description": "A utility mode for better gaming",
+  "authors": [
+    "matl114"
+  ],
+  "contact": {
+    "homepage": "https://github.com/matl114/SlimefunHelper",
+    "sources": "https://github.com/matl114/SlimefunHelper"
+  },
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "me.matl114.SlimefunHelper"
+    ]
+  },
+  "mixins": [
+    "slimefunhelper.mixins.json",
+    "slimefunhelper.mixins.hooks.json"
+  ],
+  "custom": {
+    "meteor-client:color": "225,25,25",
+    "modmenu": {
+      "parent": {
+        "id": "meteor-client"
+      }
+    }
+  },
+  "depends": {
+    "fabricloader": ">=0.15.1",
+    "minecraft": "${minecraft_version}",
+    "java": ">=21",
+    "fabric-api": "*",
+    "meteor-client": "*"
+  },
+  "accessWidener": "overrideList.accesswidener"
+}
